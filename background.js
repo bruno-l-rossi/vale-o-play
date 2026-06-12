@@ -104,25 +104,11 @@ function pickBest(candidates, title, hint) {
 
 // ---- Ponte TMDB: título em português -> título em inglês + ano + tipo ----
 
-let tmdbKey = null;
-
-async function getTmdbKey() {
-  if (tmdbKey !== null) return tmdbKey;
-  const obj = await chrome.storage.sync.get("tmdbApiKey");
-  tmdbKey = obj.tmdbApiKey || "";
-  return tmdbKey;
-}
-
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "sync" && changes.tmdbApiKey) {
-    tmdbKey = changes.tmdbApiKey.newValue || "";
-  }
-});
+// Chave embutida (API Key v3, gratuita).
+const TMDB_KEY = "b365168d89c44163386f93582187bfda";
 
 async function tmdbJson(path, params) {
-  const key = await getTmdbKey();
-  if (!key) return null;
-  const qs = new URLSearchParams({ api_key: key, ...params });
+  const qs = new URLSearchParams({ api_key: TMDB_KEY, ...params });
   const res = await fetch(`https://api.themoviedb.org/3/${path}?${qs}`);
   if (!res.ok) return null;
   return res.json();

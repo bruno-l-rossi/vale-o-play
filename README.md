@@ -7,18 +7,13 @@ Extensão de Chrome que mostra as notas do Rotten Tomatoes direto nos cards da N
 1. Abra `chrome://extensions` no Chrome.
 2. Ative o **Modo do desenvolvedor** (canto superior direito).
 3. Clique em "Carregar sem compactação" e selecione esta pasta (`netflix-rotten-tomatoes`).
-4. Configure a chave do TMDB (passo abaixo). Sem ela, a busca usa o título em português e erra muito.
-5. Abra a Netflix. Os badges aparecem alguns segundos depois que a página carrega.
+4. Abra a Netflix. Os badges aparecem alguns segundos depois que a página carrega. Nenhuma configuração é necessária.
 
-## Chave do TMDB (título em português → inglês)
+## Como o título em português vira inglês
 
 A Netflix mostra os títulos em português e o Rotten Tomatoes indexa em inglês. A extensão resolve isso com o TMDB (The Movie Database): busca o título PT lá, recebe o nome em inglês, o ano e o tipo (filme ou série), e só então consulta o RT. Ano e tipo desempatam casos de obras homônimas.
 
-A chave é gratuita:
-
-1. Crie uma conta em [themoviedb.org/signup](https://www.themoviedb.org/signup).
-2. Vá em Configurações → API e copie a **API Key v3** (o pedido é aprovado na hora pra uso pessoal).
-3. Em `chrome://extensions`, clique em "Detalhes" na extensão → "Opções da extensão", cole a chave e salve. A página testa a chave na hora.
+A chave da API do TMDB já vem embutida no código. Não há nada pra configurar.
 
 ## Como funciona
 
@@ -51,4 +46,3 @@ Enviar só o `.crx` por fora da Web Store não funciona: o Chrome bloqueia a ins
 | `content.js` | Roda na Netflix: acha os cards e injeta os badges |
 | `background.js` | Ponte TMDB, busca no RT, cache e fila de requisições |
 | `styles.css` | Visual do badge |
-| `options.html` / `options.js` | Página de opções pra salvar a chave do TMDB |
