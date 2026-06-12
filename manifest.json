@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Vale o Play?",
+  "version": "1.0.0",
+  "description": "Mostra as notas de críticos e audiência do Rotten Tomatoes direto nos cards da Netflix.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://www.rottentomatoes.com/*",
+    "https://api.themoviedb.org/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.netflix.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
