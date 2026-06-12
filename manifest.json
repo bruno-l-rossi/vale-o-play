@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Vale o Play?",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Mostra as notas de críticos e audiência do Rotten Tomatoes direto nos cards da Netflix.",
   "icons": {
     "16": "icons/icon16.png",

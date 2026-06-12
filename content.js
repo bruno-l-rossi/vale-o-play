@@ -2,18 +2,33 @@
 
 const DONE_ATTR = "data-rt-done";
 const SCAN_DEBOUNCE_MS = 600;
+const LOG = "[Vale o Play?]";
+
+// 3 estratégias de detecção, da mais específica pra mais genérica,
+// porque a Netflix muda as classes do DOM de tempos em tempos.
+function findCards() {
+  let cards = document.querySelectorAll(".title-card, .title-card-container");
+  if (cards.length) return [...cards];
+
+  cards = document.querySelectorAll(".boxart-container, .boxart-round");
+  if (cards.length) return [...cards].map((c) => c.closest("a") || c);
+
+  // genérica: âncoras de título/watch viram o próprio card
+  const links = document.querySelectorAll(
+    'a[href*="/watch/"], a[href*="/title/"]'
+  );
+  return [...links];
+}
 
 function getTitleFromCard(card) {
-  // 1ª opção: aria-label do link (mais confiável)
-  const link = card.querySelector("a[aria-label]");
-  if (link) {
-    const label = link.getAttribute("aria-label");
-    if (label && label.trim()) return label.trim();
-  }
-  // 2ª opção: texto de fallback que a Netflix usa quando a arte não carrega
-  const fallback = card.querySelector(".fallback-text");
-  if (fallback && fallback.textContent.trim()) {
-    return fallback.textContent.trim();
+  const sources = [
+    card.getAttribute && card.getAttribute("aria-label"),
+    card.querySelector?.("a[aria-label]")?.getAttribute("aria-label"),
+    card.querySelector?.(".fallback-text")?.textContent,
+    card.querySelector?.("img[alt]")?.getAttribute("alt"),
+  ];
+  for (const s of sources) {
+    if (s && s.trim().length > 1) return s.trim();
   }
   return null;
 }
@@ -50,10 +65,14 @@ function requestScore(title) {
   return new Promise((resolve) => {
     try {
       chrome.runtime.sendMessage({ type: "getScore", title }, (res) => {
-        if (chrome.runtime.lastError) return resolve(null);
+        if (chrome.runtime.lastError) {
+          console.warn(LOG, "erro de mensagem:", chrome.runtime.lastError.message);
+          return resolve(null);
+        }
         resolve(res && res.ok ? res.value : null);
       });
     } catch (e) {
+      console.warn(LOG, "exceção ao pedir nota:", e.message);
       resolve(null);
     }
   });
@@ -76,18 +95,27 @@ async function processCard(card) {
   const badge = buildBadge(score);
   if (!badge) return;
 
-  // o card precisa ser referência de posição pro badge absoluto
   if (getComputedStyle(card).position === "static") {
     card.style.position = "relative";
   }
   card.appendChild(badge);
 }
 
+let lastCount = -1;
 function scan() {
-  const cards = document.querySelectorAll(
-    `.title-card:not([${DONE_ATTR}])`
-  );
-  cards.forEach(processCard);
+  const all = findCards();
+  const fresh = all.filter((c) => !c.hasAttribute(DONE_ATTR));
+  if (all.length !== lastCount) {
+    lastCount = all.length;
+    console.info(LOG, `${all.length} cards detectados, ${fresh.length} novos`);
+    if (all.length === 0) {
+      console.warn(
+        LOG,
+        "nenhum card encontrado. A estrutura da página da Netflix pode ter mudado; reporte este aviso."
+      );
+    }
+  }
+  fresh.forEach(processCard);
 }
 
 let scanTimer = null;
@@ -96,6 +124,7 @@ function scheduleScan() {
   scanTimer = setTimeout(scan, SCAN_DEBOUNCE_MS);
 }
 
+console.info(LOG, "extensão carregada nesta página");
 const observer = new MutationObserver(scheduleScan);
 observer.observe(document.body, { childList: true, subtree: true });
 
