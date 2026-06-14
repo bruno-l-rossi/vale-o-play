@@ -3,13 +3,15 @@
 // Mudança da v2: o endpoint interno do RT (rottentomatoes.com/napi/search/all)
 // saiu do ar (responde 404). A nota do RT agora vem do OMDb, que é API oficial e
 // estável. O OMDb entrega a nota dos CRÍTICOS do RT (não a da audiência, que
-// nenhuma API gratuita expõe). Sem nota do RT, cai pra nota do público do TMDB.
+// nenhuma API gratuita expõe). Sem nota do RT, cai pra nota do IMDb, que vem
+// na mesma resposta do OMDb (o IMDb tem base de votos maior e mais reconhecida
+// que a do TMDB; o TMDB fica só de ponte pra casar o título PT com a obra certa).
 
 const POSITIVE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 dias
 const NEGATIVE_TTL = 24 * 60 * 60 * 1000; // 1 dia (título sem nota)
-const MAX_CONCURRENT = 2;
-const GAP_MS = 300; // pausa entre requisições
-const MIN_TMDB_VOTES = 50; // ignora nota TMDB de título obscuro (1 voto vira nota fake)
+const MAX_CONCURRENT = 4;
+const GAP_MS = 80; // pausa entre requisições (TMDB e OMDb aguentam bem)
+const MIN_IMDB_VOTES = 500; // ignora nota IMDb de título obscuro
 
 // Chave do TMDB (v3, gratuita) já embutida.
 const TMDB_KEY = "b365168d89c44163386f93582187bfda";
@@ -57,7 +59,7 @@ function toInt(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-// ---- TMDB: título PT -> tipo, ano, nota do público e (se precisar) IMDb id ----
+// ---- TMDB: título PT -> obra certa + IMDb id (ponte pro OMDb) ----
 
 async function tmdbJson(path, params) {
   const qs = new URLSearchParams({ api_key: TMDB_KEY, ...params });
@@ -84,29 +86,22 @@ async function resolveViaTmdb(title) {
     results.find((r) => normalize(r.title || r.name) === target) || results[0];
 
   const type = best.media_type === "movie" ? "movie" : "tv";
-  const date = best.release_date || best.first_air_date || "";
 
-  const out = {
+  // o IMDb id é a ponte pro OMDb (de onde saem a nota do RT e a do IMDb)
+  const ext = await tmdbJson(`${type}/${best.id}/external_ids`, {});
+
+  return {
     type,
     id: best.id,
-    year: toInt(date.slice(0, 4)),
-    rating: typeof best.vote_average === "number" ? best.vote_average : null,
-    votes: best.vote_count || 0,
-    imdbId: null,
-    tmdbUrl: `https://www.themoviedb.org/${type}/${best.id}`,
+    imdbId: ext?.imdb_id || null,
   };
-
-  // só busca o IMDb id se for usar o OMDb (evita requisição à toa)
-  if (OMDB_KEY) {
-    const ext = await tmdbJson(`${type}/${best.id}/external_ids`, {});
-    out.imdbId = ext?.imdb_id || null;
-  }
-  return out;
 }
 
-// ---- OMDb: nota dos críticos do Rotten Tomatoes pelo IMDb id ----
+// ---- OMDb: nota dos críticos do RT + nota do IMDb, pelo IMDb id ----
+// As duas vêm na mesma resposta: o RT (quando existe, sobretudo filme) e a
+// nota do IMDb (quase sempre presente, inclusive em série).
 
-async function omdbRtCritics(imdbId) {
+async function omdbLookup(imdbId) {
   try {
     const res = await fetch(
       `https://www.omdbapi.com/?apikey=${OMDB_KEY}&i=${imdbId}&tomatoes=true`
@@ -114,8 +109,20 @@ async function omdbRtCritics(imdbId) {
     if (!res.ok) return null;
     const d = await res.json();
     if (!d || d.Response === "False") return null;
+
     const rt = (d.Ratings || []).find((r) => r.Source === "Rotten Tomatoes");
-    return rt ? toInt(rt.Value) : null; // "86%" -> 86
+    const imdbRating =
+      d.imdbRating && d.imdbRating !== "N/A" ? parseFloat(d.imdbRating) : null;
+    const imdbVotes =
+      d.imdbVotes && d.imdbVotes !== "N/A"
+        ? toInt(d.imdbVotes.replace(/,/g, ""))
+        : 0;
+
+    return {
+      critics: rt ? toInt(rt.Value) : null, // "85%" -> 85
+      imdbRating: Number.isFinite(imdbRating) ? imdbRating : null,
+      imdbVotes: imdbVotes || 0,
+    };
   } catch (e) {
     return null;
   }
@@ -123,17 +130,15 @@ async function omdbRtCritics(imdbId) {
 
 async function fetchScore(title) {
   const tmdb = await resolveViaTmdb(title);
-  if (!tmdb) return null;
+  if (!tmdb || !tmdb.imdbId) return null; // sem IMDb id não dá pra consultar o OMDb
 
-  // tenta a nota real do RT (críticos) via OMDb, se houver chave e IMDb id
-  let critics = null;
-  if (OMDB_KEY && tmdb.imdbId) {
-    critics = await omdbRtCritics(tmdb.imdbId);
-  }
+  const omdb = await omdbLookup(tmdb.imdbId);
+  if (!omdb) return null;
 
-  if (critics !== null) {
+  // 1ª fonte: nota dos críticos do Rotten Tomatoes
+  if (omdb.critics !== null) {
     return {
-      critics, // nota dos críticos do RT (0 a 100)
+      critics: omdb.critics, // 0 a 100
       rating: null,
       source: "rt",
       url:
@@ -142,13 +147,13 @@ async function fetchScore(title) {
     };
   }
 
-  // sem RT: nota do público no TMDB (só com votos suficientes pra ser confiável)
-  if (tmdb.rating !== null && tmdb.votes >= MIN_TMDB_VOTES) {
+  // reserva: nota do IMDb (mesma resposta do OMDb), se tiver votos suficientes
+  if (omdb.imdbRating !== null && omdb.imdbVotes >= MIN_IMDB_VOTES) {
     return {
       critics: null,
-      rating: tmdb.rating, // 0 a 10
-      source: "tmdb",
-      url: tmdb.tmdbUrl,
+      rating: omdb.imdbRating, // 0 a 10
+      source: "imdb",
+      url: `https://www.imdb.com/title/${tmdb.imdbId}/`,
     };
   }
 

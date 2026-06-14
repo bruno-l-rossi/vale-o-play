@@ -43,8 +43,8 @@ function buildBadge(score) {
     const icon = score.critics >= 60 ? "🍅" : "🟢";
     parts.push(`<span class="rt-part" title="Críticos (Rotten Tomatoes)">${icon} ${score.critics}%</span>`);
   } else if (score.rating !== null && score.rating !== undefined) {
-    // sem RT: nota do público no TMDB (0 a 10)
-    parts.push(`<span class="rt-part" title="Nota do público (TMDB)">⭐ ${score.rating.toFixed(1)}</span>`);
+    // sem RT: nota do IMDb (0 a 10)
+    parts.push(`<span class="rt-part" title="Nota IMDb">⭐ ${score.rating.toFixed(1)}</span>`);
   }
   if (!parts.length) return null;
 
