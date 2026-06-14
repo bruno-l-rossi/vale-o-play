@@ -1,8 +1,8 @@
 # Vale o Play?
 
-Extensão de Chrome que mostra a nota do título direto nos cards da Netflix, sem precisar passar o mouse. Cada título ganha um badge no canto da capa. Com a nota do Rotten Tomatoes ligada, aparece 🍅 (críticos, padrão "fresh") ou 🟢 abaixo de 60% (padrão "podre"). Sem RT, o badge mostra ⭐ com a nota do público no TMDB (de 0 a 10). Clicar no badge abre a página do título.
+Extensão de Chrome que mostra a nota do título direto nos cards da Netflix, sem precisar passar o mouse. Cada título ganha um badge no canto da capa. Quando o Rotten Tomatoes tem o título, aparece o 🍅 dos críticos (ou 🟢 abaixo de 60%, o padrão "podre"). Quando não tem, o badge mostra ⭐ com a nota do público no TMDB (de 0 a 10). Clicar no badge abre a página do título.
 
-Instalou, abriu a Netflix, funcionou. Zero configuração pra ver a nota do TMDB; um passo extra de 1 minuto pra ligar a nota do RT (veja abaixo).
+Instalou, abriu a Netflix, funcionou. Zero configuração: as chaves de API já vêm embutidas no código.
 
 ## Instalação
 
@@ -16,23 +16,21 @@ Instalou, abriu a Netflix, funcionou. Zero configuração pra ver a nota do TMDB
 
 A Netflix mostra os títulos em português. A extensão busca esse título no TMDB (The Movie Database), que casa o nome PT com a obra certa e devolve o tipo (filme ou série), o ano, o IMDb id e a nota do público. Ano e tipo desempatam homônimos, tipo o filme e a série "Wednesday".
 
-Com a nota do RT ligada, a extensão usa o IMDb id pra consultar o OMDb e pegar a nota dos críticos do Rotten Tomatoes. Sem RT (ou quando o OMDb não tem o título), o badge mostra a nota do público no TMDB.
+Em seguida, a extensão usa o IMDb id pra consultar o OMDb e pegar a nota dos críticos do Rotten Tomatoes. Quando o OMDb não tem aquele título, o badge cai pra nota do público do TMDB.
 
-A chave da API do TMDB já vem embutida no código.
+As duas chaves de API (TMDB e OMDb) já vêm embutidas no código, então não tem nada pra configurar.
 
-## Ligar a nota do Rotten Tomatoes (opcional)
+## Sobre o Rotten Tomatoes (histórico e nota pra quem mantém)
 
-A nota da audiência do RT (🍿) saiu de cena: o endpoint interno que entregava ela morreu, e nenhuma API gratuita expõe a nota da audiência. A nota dos críticos (🍅) continua disponível pelo OMDb, que é oficial e estável.
+Até a v1, a extensão lia as duas notas do RT (críticos 🍅 e audiência 🍿) de um endpoint interno não oficial do site (`rottentomatoes.com/napi/search/all`). Esse endpoint saiu do ar e passou a responder 404, e a extensão parou de mostrar nota.
 
-1. Pegue uma chave grátis em [omdbapi.com/apikey.aspx](https://www.omdbapi.com/apikey.aspx) (plano FREE, chega por email em 1 minuto).
-2. Abra `background.js` e cole a chave em `const OMDB_KEY = ""`.
-3. Recarregue a extensão em `chrome://extensions`.
+A v2 trocou a fonte pelo OMDb, uma API oficial e estável que repassa a nota dos críticos do RT. A nota da audiência (🍿) foi descontinuada: ela só existe no site do próprio RT, e nenhuma API gratuita a expõe.
 
-Sem chave, a extensão funciona normal mostrando a nota do TMDB.
+A chave do OMDb embutida é do plano FREE (1000 requisições por dia). Se um dia ela estourar o limite ou for abusada, pegue outra grátis em [omdbapi.com/apikey.aspx](https://www.omdbapi.com/apikey.aspx), ative pelo link do email e troque o valor de `const OMDB_KEY` no `background.js`.
 
 ## Como funciona por dentro
 
-O content script (`content.js`) observa a página da Netflix e lê o nome de cada card. O service worker (`background.js`) resolve o título no TMDB, pega a nota do RT no OMDb (se houver chave) e devolve o resultado.
+O content script (`content.js`) observa a página da Netflix e lê o nome de cada card. O service worker (`background.js`) resolve o título no TMDB, pega a nota dos críticos do RT no OMDb e devolve o resultado pro card.
 
 Tem 3 proteções contra excesso de requisição: cache de 7 dias por título (1 dia quando não acha nota), máximo de 2 requisições simultâneas com pausa de 300ms entre elas, e deduplicação de pedidos repetidos.
 

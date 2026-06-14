@@ -17,7 +17,7 @@ const TMDB_KEY = "b365168d89c44163386f93582187bfda";
 // Chave do OMDb. OPCIONAL. Sem ela, a extensão funciona mostrando a nota do TMDB.
 // Pra ligar a nota real do Rotten Tomatoes (🍅), pegue uma chave grátis em
 // https://www.omdbapi.com/apikey.aspx (leva 1 minuto, chega por email) e cole aqui.
-const OMDB_KEY = "";
+const OMDB_KEY = "c02a8f8d";
 
 const memCache = new Map();
 const inFlight = new Map(); // título -> Promise (deduplica pedidos simultâneos)
