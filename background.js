@@ -1,10 +1,23 @@
-// Service worker: consulta o Rotten Tomatoes e devolve notas pro content script.
-// Endpoint não oficial: https://www.rottentomatoes.com/napi/search/all?searchQuery=...
+// Service worker: resolve o título no TMDB e busca a nota do Rotten Tomatoes (via OMDb).
+//
+// Mudança da v2: o endpoint interno do RT (rottentomatoes.com/napi/search/all)
+// saiu do ar (responde 404). A nota do RT agora vem do OMDb, que é API oficial e
+// estável. O OMDb entrega a nota dos CRÍTICOS do RT (não a da audiência, que
+// nenhuma API gratuita expõe). Sem nota do RT, cai pra nota do público do TMDB.
 
 const POSITIVE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 dias
-const NEGATIVE_TTL = 24 * 60 * 60 * 1000; // 1 dia (título não encontrado)
+const NEGATIVE_TTL = 24 * 60 * 60 * 1000; // 1 dia (título sem nota)
 const MAX_CONCURRENT = 2;
-const GAP_MS = 300; // pausa entre requisições pra não martelar o RT
+const GAP_MS = 300; // pausa entre requisições
+const MIN_TMDB_VOTES = 50; // ignora nota TMDB de título obscuro (1 voto vira nota fake)
+
+// Chave do TMDB (v3, gratuita) já embutida.
+const TMDB_KEY = "b365168d89c44163386f93582187bfda";
+
+// Chave do OMDb. OPCIONAL. Sem ela, a extensão funciona mostrando a nota do TMDB.
+// Pra ligar a nota real do Rotten Tomatoes (🍅), pegue uma chave grátis em
+// https://www.omdbapi.com/apikey.aspx (leva 1 minuto, chega por email) e cole aqui.
+const OMDB_KEY = "";
 
 const memCache = new Map();
 const inFlight = new Map(); // título -> Promise (deduplica pedidos simultâneos)
@@ -44,68 +57,7 @@ function toInt(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-// Extrai candidatos do JSON do RT lidando com mais de um formato de resposta.
-function extractCandidates(data) {
-  const out = [];
-  const buckets = [
-    ["movie", data?.movie?.items],
-    ["movie", data?.movies],
-    ["tv", data?.tvSeries?.items],
-    ["tv", data?.tvSeries],
-    ["tv", data?.tvs],
-  ];
-  for (const [type, items] of buckets) {
-    if (!Array.isArray(items)) continue;
-    for (const c of items) {
-      out.push({
-        type,
-        name: c.name || c.title || "",
-        year: toInt(c.releaseYear || c.year || c.startYear),
-        critics: toInt(
-          c.criticsScore?.score ?? c.tomatometerScore?.score ?? c.meterScore
-        ),
-        audience: toInt(c.audienceScore?.score),
-        url: c.url || null,
-      });
-    }
-  }
-  return out;
-}
-
-// Pontua cada candidato do RT contra o título buscado.
-// hint (vindo do TMDB) traz ano e tipo (filme/série) pra desempatar com precisão.
-function pickBest(candidates, title, hint) {
-  const target = normalize(title);
-  const withScore = (c) => c.critics !== null || c.audience !== null;
-  let pool = candidates.filter(withScore);
-  if (!pool.length) pool = candidates;
-
-  const points = (c) => {
-    const name = normalize(c.name);
-    let s = 0;
-    if (name === target) s += 4;
-    else if (name.includes(target) || target.includes(name)) s += 1;
-    if (hint?.type && c.type === hint.type) s += 2;
-    if (hint?.year && c.year && Math.abs(c.year - hint.year) <= 1) s += 3;
-    return s;
-  };
-
-  let best = null;
-  let bestScore = 0;
-  for (const c of pool) {
-    const s = points(c);
-    if (s > bestScore) {
-      bestScore = s;
-      best = c;
-    }
-  }
-  return bestScore > 0 ? best : null;
-}
-
-// ---- Ponte TMDB: título em português -> título em inglês + ano + tipo ----
-
-// Chave embutida (API Key v3, gratuita).
-const TMDB_KEY = "b365168d89c44163386f93582187bfda";
+// ---- TMDB: título PT -> tipo, ano, nota do público e (se precisar) IMDb id ----
 
 async function tmdbJson(path, params) {
   const qs = new URLSearchParams({ api_key: TMDB_KEY, ...params });
@@ -114,7 +66,6 @@ async function tmdbJson(path, params) {
   return res.json();
 }
 
-// Busca o título PT no TMDB e devolve o nome em inglês, ano e tipo.
 async function resolveViaTmdb(title) {
   const data = await tmdbJson("search/multi", {
     query: title,
@@ -131,58 +82,77 @@ async function resolveViaTmdb(title) {
   const target = normalize(title);
   const best =
     results.find((r) => normalize(r.title || r.name) === target) || results[0];
+
   const type = best.media_type === "movie" ? "movie" : "tv";
   const date = best.release_date || best.first_air_date || "";
 
-  // pega o título em inglês (original pode ser coreano, francês etc.)
-  let enTitle = null;
-  const details = await tmdbJson(`${type}/${best.id}`, { language: "en-US" });
-  if (details) enTitle = details.title || details.name;
-  if (!enTitle) enTitle = best.original_title || best.original_name;
-  if (!enTitle) return null;
+  const out = {
+    type,
+    id: best.id,
+    year: toInt(date.slice(0, 4)),
+    rating: typeof best.vote_average === "number" ? best.vote_average : null,
+    votes: best.vote_count || 0,
+    imdbId: null,
+    tmdbUrl: `https://www.themoviedb.org/${type}/${best.id}`,
+  };
 
-  return { enTitle, year: toInt(date.slice(0, 4)), type };
+  // só busca o IMDb id se for usar o OMDb (evita requisição à toa)
+  if (OMDB_KEY) {
+    const ext = await tmdbJson(`${type}/${best.id}/external_ids`, {});
+    out.imdbId = ext?.imdb_id || null;
+  }
+  return out;
 }
 
-async function searchRt(query, hint) {
-  const url =
-    "https://www.rottentomatoes.com/napi/search/all?searchQuery=" +
-    encodeURIComponent(query);
-  const res = await fetch(url, {
-    headers: { Accept: "application/json" },
-  });
-  if (!res.ok) throw new Error("RT respondeu " + res.status);
-  const data = await res.json();
-  return pickBest(extractCandidates(data), query, hint);
+// ---- OMDb: nota dos críticos do Rotten Tomatoes pelo IMDb id ----
+
+async function omdbRtCritics(imdbId) {
+  try {
+    const res = await fetch(
+      `https://www.omdbapi.com/?apikey=${OMDB_KEY}&i=${imdbId}&tomatoes=true`
+    );
+    if (!res.ok) return null;
+    const d = await res.json();
+    if (!d || d.Response === "False") return null;
+    const rt = (d.Ratings || []).find((r) => r.Source === "Rotten Tomatoes");
+    return rt ? toInt(rt.Value) : null; // "86%" -> 86
+  } catch (e) {
+    return null;
+  }
 }
 
 async function fetchScore(title) {
-  // 1º: traduz o título via TMDB (se houver chave configurada)
-  let hint = null;
-  try {
-    hint = await resolveViaTmdb(title);
-  } catch (e) {
-    hint = null;
+  const tmdb = await resolveViaTmdb(title);
+  if (!tmdb) return null;
+
+  // tenta a nota real do RT (críticos) via OMDb, se houver chave e IMDb id
+  let critics = null;
+  if (OMDB_KEY && tmdb.imdbId) {
+    critics = await omdbRtCritics(tmdb.imdbId);
   }
 
-  // busca no RT com o nome em inglês; sem TMDB, tenta o nome como veio
-  let best = await searchRt(hint?.enTitle || title, hint);
-
-  // fallback: tinha tradução mas o RT não achou; tenta o título original
-  if (!best && hint) {
-    best = await searchRt(title, null);
+  if (critics !== null) {
+    return {
+      critics, // nota dos críticos do RT (0 a 100)
+      rating: null,
+      source: "rt",
+      url:
+        "https://www.rottentomatoes.com/search?search=" +
+        encodeURIComponent(title),
+    };
   }
-  if (!best) return null;
 
-  return {
-    critics: best.critics,
-    audience: best.audience,
-    url: best.url
-      ? best.url.startsWith("http")
-        ? best.url
-        : "https://www.rottentomatoes.com" + best.url
-      : null,
-  };
+  // sem RT: nota do público no TMDB (só com votos suficientes pra ser confiável)
+  if (tmdb.rating !== null && tmdb.votes >= MIN_TMDB_VOTES) {
+    return {
+      critics: null,
+      rating: tmdb.rating, // 0 a 10
+      source: "tmdb",
+      url: tmdb.tmdbUrl,
+    };
+  }
+
+  return null;
 }
 
 function runQueue() {
