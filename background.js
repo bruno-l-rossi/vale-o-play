@@ -1,11 +1,14 @@
-// Service worker: resolve o título no TMDB e busca a nota do Rotten Tomatoes (via OMDb).
+// Service worker: descobre as notas de um título e devolve pro content script.
 //
-// Mudança da v2: o endpoint interno do RT (rottentomatoes.com/napi/search/all)
-// saiu do ar (responde 404). A nota do RT agora vem do OMDb, que é API oficial e
-// estável. O OMDb entrega a nota dos CRÍTICOS do RT (não a da audiência, que
-// nenhuma API gratuita expõe). Sem nota do RT, cai pra nota do IMDb, que vem
-// na mesma resposta do OMDb (o IMDb tem base de votos maior e mais reconhecida
-// que a do TMDB; o TMDB fica só de ponte pra casar o título PT com a obra certa).
+// Pipeline (v2.2): TMDB casa o título PT com a obra certa e dá o IMDb id. O OMDb
+// (pelo IMDb id) dá o link da página do RT pra filme, mais a nota do IMDb de
+// reserva. Aí a extensão RASPA a página do RT pra pegar os DOIS números:
+// críticos (Tomatometer) e audiência (Popcornmeter). Pra série, que o OMDb não
+// cobre, a URL do RT é adivinhada a partir do nome em inglês.
+//
+// PARTE FRÁGIL: a raspagem depende do HTML do RT. Se o RT mudar o layout, ou
+// bloquear as requisições, o parser (parseRtScores) é o lugar pra ajustar; o
+// IMDb continua entrando como rede de segurança quando o RT falha.
 
 const POSITIVE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 dias
 const NEGATIVE_TTL = 24 * 60 * 60 * 1000; // 1 dia (título sem nota)
@@ -36,8 +39,12 @@ function normalize(s) {
     .trim();
 }
 
+// Versão do cache. Muda quando a lógica/fonte da nota muda, pra invalidar
+// automaticamente o cache antigo (ex.: entradas salvas na época sem chave OMDb).
+const CACHE_VERSION = "v4";
+
 function cacheKey(title) {
-  return "rt:" + normalize(title);
+  return CACHE_VERSION + ":" + normalize(title);
 }
 
 async function getFromStorage(key) {
@@ -57,6 +64,12 @@ async function setInStorage(key, value) {
 function toInt(v) {
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : null;
+}
+
+// percentual válido (0 a 100) ou null
+function clampPct(v) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n >= 0 && n <= 100 ? n : null;
 }
 
 // ---- TMDB: título PT -> obra certa + IMDb id (ponte pro OMDb) ----
@@ -97,9 +110,7 @@ async function resolveViaTmdb(title) {
   };
 }
 
-// ---- OMDb: nota dos críticos do RT + nota do IMDb, pelo IMDb id ----
-// As duas vêm na mesma resposta: o RT (quando existe, sobretudo filme) e a
-// nota do IMDb (quase sempre presente, inclusive em série).
+// ---- OMDb: link da página do RT (filme) + título em inglês + nota do IMDb ----
 
 async function omdbLookup(imdbId) {
   try {
@@ -119,7 +130,12 @@ async function omdbLookup(imdbId) {
         : 0;
 
     return {
-      critics: rt ? toInt(rt.Value) : null, // "85%" -> 85
+      enTitle: d.Title && d.Title !== "N/A" ? d.Title : null,
+      year: toInt((d.Year || "").slice(0, 4)),
+      // link direto da página do RT (vem pra filme; série costuma ser "N/A")
+      tomatoUrl: d.tomatoURL && d.tomatoURL !== "N/A" ? d.tomatoURL : null,
+      // nota dos críticos que o OMDb já traz (filme), usada como reserva do RT
+      critics: rt ? clampPct(rt.Value) : null,
       imdbRating: Number.isFinite(imdbRating) ? imdbRating : null,
       imdbVotes: imdbVotes || 0,
     };
@@ -128,29 +144,95 @@ async function omdbLookup(imdbId) {
   }
 }
 
+// ---- Raspagem da página do RT: pega Tomatometer (críticos) e Popcornmeter (audiência) ----
+
+// Monta URLs candidatas do RT a partir do nome em inglês (pra série, que não
+// vem com link pronto do OMDb). Acerta a maioria dos títulos populares.
+function rtSlugCandidates(enTitle, type, year) {
+  if (!enTitle) return [];
+  const slug = enTitle
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!slug) return [];
+  const path = type === "movie" ? "m" : "tv";
+  const out = [`https://www.rottentomatoes.com/${path}/${slug}`];
+  if (year) out.push(`https://www.rottentomatoes.com/${path}/${slug}_${year}`);
+  return out;
+}
+
+// Lê os dois números do JSON embutido na página do RT (script media-hero-json).
+// Cada objeto tem a porcentagem no campo "score": "criticsScore":{...,"score":"68",...}
+// e "audienceScore":{...,"score":"89",...}. O [^}] mantém a busca dentro do
+// próprio objeto, pra não pegar a nota de outro título da página. É o ponto
+// frágil: se o RT trocar esses nomes de campo, é aqui que se ajusta.
+function parseRtScores(html) {
+  const grab = (key) => {
+    const m = html.match(
+      new RegExp('"' + key + '"\\s*:\\s*\\{[^}]*?"score"\\s*:\\s*"?(\\d{1,3})"?', "i")
+    );
+    return m ? clampPct(m[1]) : null;
+  };
+  return {
+    critics: grab("criticsScore"),
+    audience: grab("audienceScore"),
+  };
+}
+
+async function fetchRtPage(url) {
+  try {
+    const res = await fetch(url, { headers: { Accept: "text/html" } });
+    if (!res.ok) return null; // 404 = slug errado, segue pro próximo candidato
+    const html = await res.text();
+    const s = parseRtScores(html);
+    return s.critics !== null || s.audience !== null ? s : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function fetchScore(title) {
   const tmdb = await resolveViaTmdb(title);
-  if (!tmdb || !tmdb.imdbId) return null; // sem IMDb id não dá pra consultar o OMDb
+  if (!tmdb || !tmdb.imdbId) return null; // sem IMDb id não dá pra seguir
 
   const omdb = await omdbLookup(tmdb.imdbId);
   if (!omdb) return null;
 
-  // 1ª fonte: nota dos críticos do Rotten Tomatoes
+  // 1ª fonte: RASPA a página do RT pra ter críticos + audiência.
+  // Filme traz o link pronto (tomatoUrl); série a gente adivinha pelo nome.
+  const rtUrls = omdb.tomatoUrl
+    ? [omdb.tomatoUrl]
+    : rtSlugCandidates(omdb.enTitle, tmdb.type, omdb.year);
+
+  for (const u of rtUrls) {
+    const rt = await fetchRtPage(u);
+    if (rt) {
+      return { critics: rt.critics, audience: rt.audience, rating: null, source: "rt", url: u };
+    }
+  }
+
+  // reserva do RT: a nota dos críticos que o OMDb já trazia (sem audiência)
   if (omdb.critics !== null) {
     return {
-      critics: omdb.critics, // 0 a 100
+      critics: omdb.critics,
+      audience: null,
       rating: null,
       source: "rt",
       url:
+        omdb.tomatoUrl ||
         "https://www.rottentomatoes.com/search?search=" +
-        encodeURIComponent(title),
+          encodeURIComponent(title),
     };
   }
 
-  // reserva: nota do IMDb (mesma resposta do OMDb), se tiver votos suficientes
+  // plano B: nota do IMDb, se tiver votos suficientes
   if (omdb.imdbRating !== null && omdb.imdbVotes >= MIN_IMDB_VOTES) {
     return {
       critics: null,
+      audience: null,
       rating: omdb.imdbRating, // 0 a 10
       source: "imdb",
       url: `https://www.imdb.com/title/${tmdb.imdbId}/`,

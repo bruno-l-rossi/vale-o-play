@@ -1,7 +1,7 @@
 .rt-badge {
   position: absolute;
   left: 4px;
-  bottom: 4px;
+  top: 4px;
   z-index: 10;
   display: flex;
   gap: 6px;

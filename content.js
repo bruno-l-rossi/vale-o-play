@@ -4,20 +4,40 @@ const DONE_ATTR = "data-rt-done";
 const SCAN_DEBOUNCE_MS = 600;
 const LOG = "[Vale o Play?]";
 
-// 3 estratégias de detecção, da mais específica pra mais genérica,
-// porque a Netflix muda as classes do DOM de tempos em tempos.
-function findCards() {
-  let cards = document.querySelectorAll(".title-card, .title-card-container");
-  if (cards.length) return [...cards];
-
-  cards = document.querySelectorAll(".boxart-container, .boxart-round");
-  if (cards.length) return [...cards].map((c) => c.closest("a") || c);
-
-  // genérica: âncoras de título/watch viram o próprio card
-  const links = document.querySelectorAll(
-    'a[href*="/watch/"], a[href*="/title/"]'
+// Resolve um nó qualquer pro "card" onde o badge vai morar, subindo pro
+// container de capa ou pra âncora mais próxima. Serve pra deduplicar: o card
+// e a âncora /watch/ dentro dele caem no mesmo root, evitando badge dobrado.
+function cardRoot(node) {
+  return (
+    node.closest?.(
+      ".title-card, .title-card-container, .boxart-container, .boxart-round"
+    ) ||
+    node.closest?.("a") ||
+    node
   );
-  return [...links];
+}
+
+// Junta todas as estratégias e deduplica por root, pra cobrir a home, a página
+// de busca e os resultados que aparecem enquanto você digita.
+function findCards() {
+  const roots = new Set();
+  const add = (n) => {
+    const r = cardRoot(n);
+    if (r) roots.add(r);
+  };
+
+  document
+    .querySelectorAll(
+      ".title-card, .title-card-container, .boxart-container, .boxart-round"
+    )
+    .forEach(add);
+
+  // âncoras de título/assistir: é assim que a busca monta os resultados
+  document
+    .querySelectorAll('a[href*="/watch/"], a[href*="/title/"]')
+    .forEach(add);
+
+  return [...roots];
 }
 
 function getTitleFromCard(card) {
@@ -39,10 +59,16 @@ function buildBadge(score) {
 
   const parts = [];
   if (score.critics !== null && score.critics !== undefined) {
-    // nota dos críticos do Rotten Tomatoes (via OMDb)
+    // críticos do Rotten Tomatoes (Tomatometer)
     const icon = score.critics >= 60 ? "🍅" : "🟢";
     parts.push(`<span class="rt-part" title="Críticos (Rotten Tomatoes)">${icon} ${score.critics}%</span>`);
-  } else if (score.rating !== null && score.rating !== undefined) {
+  }
+  if (score.audience !== null && score.audience !== undefined) {
+    // audiência do Rotten Tomatoes (Popcornmeter)
+    const icon = score.audience >= 60 ? "🍿" : "🥤";
+    parts.push(`<span class="rt-part" title="Audiência (Rotten Tomatoes)">${icon} ${score.audience}%</span>`);
+  }
+  if (!parts.length && score.rating !== null && score.rating !== undefined) {
     // sem RT: nota do IMDb (0 a 10)
     parts.push(`<span class="rt-part" title="Nota IMDb">⭐ ${score.rating.toFixed(1)}</span>`);
   }

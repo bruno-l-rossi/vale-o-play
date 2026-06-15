@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Vale o Play?",
-  "version": "2.1.0",
-  "description": "Mostra a nota do Rotten Tomatoes (ou do IMDb) direto nos cards da Netflix.",
+  "version": "2.2.0",
+  "description": "Mostra as notas de críticos e audiência do Rotten Tomatoes (ou do IMDb) nos cards da Netflix.",
   "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",
@@ -12,7 +12,8 @@
   "permissions": ["storage"],
   "host_permissions": [
     "https://api.themoviedb.org/*",
-    "https://www.omdbapi.com/*"
+    "https://www.omdbapi.com/*",
+    "https://www.rottentomatoes.com/*"
   ],
   "background": {
     "service_worker": "background.js"

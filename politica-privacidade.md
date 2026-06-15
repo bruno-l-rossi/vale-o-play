@@ -11,7 +11,8 @@ Nada. A extensão não coleta, não armazena e não transmite nenhum dado pessoa
 Pra buscar as notas, a extensão envia somente o nome dos títulos visíveis na sua tela da Netflix pra 2 serviços:
 
 1. **TMDB** (api.themoviedb.org): casa o título em português com a obra certa e devolve o IMDb id dela.
-2. **OMDb** (omdbapi.com): recebe o IMDb id do título e retorna a nota dos críticos do Rotten Tomatoes e a nota do IMDb.
+2. **OMDb** (omdbapi.com): recebe o IMDb id do título e retorna o link da página do RT e a nota do IMDb.
+3. **Rotten Tomatoes** (rottentomatoes.com): a extensão abre a página do título no RT pra ler as notas de críticos e audiência. Só a URL do título é acessada, nenhum dado seu.
 
 Nenhuma dessas requisições carrega informação sobre você: sem nome de usuário, sem e-mail, sem histórico, sem identificadores. Só o nome do título (pro TMDB) ou o IMDb id dele (pro OMDb).
 
@@ -31,7 +32,7 @@ Last updated: June 14, 2026
 
 This extension collects no personal data. There is no sign-up, no analytics, no cookies, no user identifiers.
 
-To fetch ratings, the extension sends only the names of the titles visible on your Netflix screen to 2 services: TMDB (api.themoviedb.org), to match the localized title with the right work and get its IMDb id, and OMDb (omdbapi.com), which receives the title's IMDb id and returns the Rotten Tomatoes critics score and the IMDb rating. These requests carry no information about you.
+To fetch ratings, the extension sends only the names of the titles visible on your Netflix screen to these services: TMDB (api.themoviedb.org), to match the localized title with the right work and get its IMDb id; OMDb (omdbapi.com), which receives the title's IMDb id and returns the Rotten Tomatoes page link and the IMDb rating; and Rotten Tomatoes (rottentomatoes.com), whose title page the extension opens to read the critics and audience scores. Only the title's page URL is accessed. These requests carry no information about you.
 
 Ratings are cached locally in your browser (chrome.storage) for up to 7 days to avoid repeated lookups. This cache never leaves your machine and is deleted when you remove the extension.
 
