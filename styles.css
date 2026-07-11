@@ -1,25 +1,130 @@
 .rt-badge {
   position: absolute;
-  left: 4px;
-  top: 4px;
-  z-index: 10;
+  z-index: 9999;
   display: flex;
   gap: 6px;
   align-items: center;
-  padding: 2px 6px;
   border-radius: 4px;
   background: rgba(0, 0, 0, 0.78);
   color: #fff;
   font-family: "Netflix Sans", Helvetica, Arial, sans-serif;
-  font-size: 11px;
   font-weight: 700;
   line-height: 1.4;
   pointer-events: auto;
   user-select: none;
+  /* padrão = médio + canto superior esquerdo (caso as classes faltem) */
+  font-size: 11px;
+  padding: 2px 6px;
+  left: 4px;
+  top: 4px;
+}
+
+/* Tamanhos (popup da extensão) */
+.rt-badge.rt-size-small {
+  font-size: 9px;
+  padding: 1px 4px;
+  gap: 4px;
+}
+.rt-badge.rt-size-medium {
+  font-size: 11px;
+  padding: 2px 6px;
+}
+.rt-badge.rt-size-large {
+  font-size: 15px;
+  padding: 4px 9px;
+  gap: 8px;
+  border-radius: 6px;
+}
+
+/* Posições (popup da extensão) */
+.rt-badge.rt-pos-bottom-left {
+  left: 4px;
+  bottom: 4px;
+  right: auto;
+  top: auto;
+}
+.rt-badge.rt-pos-bottom-right {
+  right: 4px;
+  bottom: 4px;
+  left: auto;
+  top: auto;
+}
+.rt-badge.rt-pos-top-left {
+  left: 4px;
+  top: 4px;
+  right: auto;
+  bottom: auto;
+}
+.rt-badge.rt-pos-top-right {
+  right: 4px;
+  top: 4px;
+  left: auto;
+  bottom: auto;
 }
 
 .rt-badge .rt-part {
   white-space: nowrap;
+}
+
+/* Fontes alternativas (IMDb/TMDB): rótulo pequeno ao lado da nota */
+.rt-badge .rt-alt small {
+  margin-left: 4px;
+  font-size: 0.75em;
+  font-weight: 400;
+  opacity: 0.75;
+  letter-spacing: 0.02em;
+}
+
+/* Filtro de qualidade: capa esmaecida quando a nota fica abaixo do corte
+   escolhido no popup. Hover devolve as cores pra não travar a navegação. */
+.rt-dim img,
+.rt-dim video {
+  filter: grayscale(0.9) brightness(0.4);
+  transition: filter 0.2s ease;
+}
+.rt-dim:hover img,
+.rt-dim:hover video {
+  filter: none;
+}
+
+/* Linha de notas perto da sinopse (visão de detalhe do título) */
+.rt-inline {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin: 6px 0 10px;
+  font-family: "Netflix Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  font-weight: 700;
+  color: #fff;
+}
+.rt-inline .rt-part {
+  white-space: nowrap;
+}
+.rt-inline .rt-alt small {
+  margin-left: 4px;
+  font-size: 0.7em;
+  font-weight: 400;
+  opacity: 0.75;
+}
+.rt-inline.rt-clickable {
+  cursor: pointer;
+}
+.rt-inline.rt-clickable:hover {
+  text-decoration: underline;
+}
+.rt-inline.rt-top-inline .rt-trophy {
+  filter: drop-shadow(0 0 2px rgba(212, 160, 23, 0.8));
+}
+
+/* Aclamados: RT com críticos e audiência acima de 90%, ou IMDb acima de 9,0 */
+.rt-badge.rt-top {
+  background: rgba(26, 20, 0, 0.85);
+  box-shadow: 0 0 0 1px #d4a017, 0 0 8px rgba(212, 160, 23, 0.55);
+}
+
+.rt-badge .rt-trophy {
+  filter: drop-shadow(0 0 2px rgba(212, 160, 23, 0.8));
 }
 
 .rt-badge.rt-clickable {

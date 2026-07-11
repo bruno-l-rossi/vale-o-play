@@ -18,9 +18,11 @@ Tudo que o Developer Dashboard pede, pronto pra copiar e colar. Os campos do for
 >
 > Funciona com o catálogo em português: a extensão identifica o nome original de cada filme ou série antes de buscar a nota, então "O Poderoso Chefão" encontra "The Godfather" certinho.
 >
-> Zero cadastro e zero configuração: instalou, abriu a Netflix, funcionou. A extensão também dispensa qualquer dado seu (veja a política de privacidade).
+> Título sem registro no Rotten Tomatoes mostra a nota do IMDb (⭐) ou, em último caso, a dos usuários do TMDB (★), sempre com o rótulo da fonte. As notas aparecem na home, na busca, nas páginas de gênero e no preview dos títulos. E os aclamados (críticos e audiência acima de 90%, ou IMDb acima de 9,0) ganham 🏆 e borda dourada.
 >
-> Título sem registro no Rotten Tomatoes fica sem badge. Extensão independente, sem vínculo com Netflix, Rotten Tomatoes ou TMDB.
+> Zero cadastro: instalou, abriu a Netflix, funcionou. No menu da extensão dá pra escolher o tamanho das notas (pequeno, médio ou grande), o canto da capa onde elas ficam e ligar o filtro de qualidade, que esmaece as capas com nota abaixo do corte que você definir. Abriu o detalhe de um título? As notas aparecem em tamanho grande junto da sinopse. A extensão também dispensa qualquer dado seu (veja a política de privacidade).
+>
+> Extensão independente, sem vínculo com Netflix, Rotten Tomatoes, IMDb ou TMDB.
 
 **Category**: Entertainment
 
@@ -43,11 +45,13 @@ Tudo que o Developer Dashboard pede, pronto pra copiar e colar. Os campos do for
 **Permission justifications**:
 
 - `storage`:
-  > Caches fetched ratings locally for up to 7 days to avoid repeated requests to external services. No personal data is stored.
+  > Caches fetched ratings locally for up to 7 days to avoid repeated requests to external services, and stores the user's display preferences (badge size and position). No personal data is stored.
 - Host permission `https://www.rottentomatoes.com/*`:
   > Fetches critic and audience scores for the titles visible on the user's Netflix page. Title names are the only data sent.
 - Host permission `https://api.themoviedb.org/*`:
-  > Translates localized (Brazilian Portuguese) Netflix titles into their original English names, so the correct title is matched. Title names are the only data sent.
+  > Matches localized (Brazilian Portuguese) Netflix titles with the correct work and retrieves its IMDb id. Title names are the only data sent.
+- Host permission `https://www.omdbapi.com/*`:
+  > Given the IMDb id, returns the title's Rotten Tomatoes page link and its IMDb rating (used as fallback when Rotten Tomatoes has no entry). Title IDs are the only data sent.
 - Content script on `https://www.netflix.com/*`:
   > Reads title names from the cards on the page and injects the rating badges. Nothing else on the page is read or modified.
 
@@ -66,7 +70,7 @@ Tudo que o Developer Dashboard pede, pronto pra copiar e colar. Os campos do for
 
 ## Checklist antes de enviar
 
-1. Rodar `git push` com a versão 1.2.0 (o politica-privacidade.md precisa estar público no GitHub antes da revisão).
+1. Rodar `git push` com a versão 2.3.0 (o politica-privacidade.md precisa estar público no GitHub antes da revisão).
 2. Subir o `vale-o-play-store.zip` (sem `.git`, sem `store/`) na aba Package.
 3. Preencher as 3 abas com os textos acima.
 4. Submit for review. Resposta costuma chegar por e-mail em poucos dias; rejeição vem com motivo e aceita reenvio.

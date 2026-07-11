@@ -1,10 +1,11 @@
 // Service worker: descobre as notas de um título e devolve pro content script.
 //
-// Pipeline (v2.2): TMDB casa o título PT com a obra certa e dá o IMDb id. O OMDb
+// Pipeline (v2.3): TMDB casa o título PT com a obra certa e dá o IMDb id. O OMDb
 // (pelo IMDb id) dá o link da página do RT pra filme, mais a nota do IMDb de
 // reserva. Aí a extensão RASPA a página do RT pra pegar os DOIS números:
 // críticos (Tomatometer) e audiência (Popcornmeter). Pra série, que o OMDb não
-// cobre, a URL do RT é adivinhada a partir do nome em inglês.
+// cobre, a URL do RT é adivinhada a partir do nome em inglês. Último recurso:
+// a nota de usuários do TMDB, rotulada, quando RT e IMDb falham.
 //
 // PARTE FRÁGIL: a raspagem depende do HTML do RT. Se o RT mudar o layout, ou
 // bloquear as requisições, o parser (parseRtScores) é o lugar pra ajustar; o
@@ -15,6 +16,7 @@ const NEGATIVE_TTL = 24 * 60 * 60 * 1000; // 1 dia (título sem nota)
 const MAX_CONCURRENT = 4;
 const GAP_MS = 80; // pausa entre requisições (TMDB e OMDb aguentam bem)
 const MIN_IMDB_VOTES = 500; // ignora nota IMDb de título obscuro
+const MIN_TMDB_VOTES = 20; // idem pro último recurso (nota de usuários do TMDB)
 
 // Chave do TMDB (v3, gratuita) já embutida.
 const TMDB_KEY = "b365168d89c44163386f93582187bfda";
@@ -41,7 +43,7 @@ function normalize(s) {
 
 // Versão do cache. Muda quando a lógica/fonte da nota muda, pra invalidar
 // automaticamente o cache antigo (ex.: entradas salvas na época sem chave OMDb).
-const CACHE_VERSION = "v4";
+const CACHE_VERSION = "v5";
 
 function cacheKey(title) {
   return CACHE_VERSION + ":" + normalize(title);
@@ -93,10 +95,16 @@ async function resolveViaTmdb(title) {
   );
   if (!results.length) return null;
 
-  // prefere match exato no nome localizado; senão o 1º (TMDB ordena por relevância)
+  // prefere match exato no nome localizado OU no original (homônimos e
+  // remakes vinham errados quando só o 1º resultado era considerado);
+  // senão o 1º (TMDB ordena por relevância)
   const target = normalize(title);
   const best =
-    results.find((r) => normalize(r.title || r.name) === target) || results[0];
+    results.find(
+      (r) =>
+        normalize(r.title || r.name) === target ||
+        normalize(r.original_title || r.original_name) === target
+    ) || results[0];
 
   const type = best.media_type === "movie" ? "movie" : "tv";
 
@@ -107,6 +115,9 @@ async function resolveViaTmdb(title) {
     type,
     id: best.id,
     imdbId: ext?.imdb_id || null,
+    // nota de usuários do TMDB: último recurso quando RT e IMDb falham
+    tmdbRating: Number.isFinite(best.vote_average) ? best.vote_average : null,
+    tmdbVotes: toInt(best.vote_count) || 0,
   };
 }
 
@@ -194,12 +205,25 @@ async function fetchRtPage(url) {
   }
 }
 
+// Nota de usuários do TMDB, rotulada: só entra quando RT e IMDb falham.
+function tmdbFallback(tmdb) {
+  if (!tmdb || !tmdb.tmdbRating || tmdb.tmdbVotes < MIN_TMDB_VOTES) return null;
+  return {
+    critics: null,
+    audience: null,
+    rating: tmdb.tmdbRating, // 0 a 10
+    source: "tmdb",
+    url: `https://www.themoviedb.org/${tmdb.type}/${tmdb.id}`,
+  };
+}
+
 async function fetchScore(title) {
   const tmdb = await resolveViaTmdb(title);
-  if (!tmdb || !tmdb.imdbId) return null; // sem IMDb id não dá pra seguir
+  if (!tmdb) return null;
+  if (!tmdb.imdbId) return tmdbFallback(tmdb); // sem IMDb id, OMDb não ajuda
 
   const omdb = await omdbLookup(tmdb.imdbId);
-  if (!omdb) return null;
+  if (!omdb) return tmdbFallback(tmdb);
 
   // 1ª fonte: RASPA a página do RT pra ter críticos + audiência.
   // Filme traz o link pronto (tomatoUrl); série a gente adivinha pelo nome.
@@ -239,7 +263,8 @@ async function fetchScore(title) {
     };
   }
 
-  return null;
+  // último recurso: nota de usuários do TMDB
+  return tmdbFallback(tmdb);
 }
 
 function runQueue() {
@@ -297,5 +322,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .then((value) => sendResponse({ ok: true, value }))
       .catch(() => sendResponse({ ok: false, value: null }));
     return true; // resposta assíncrona
+  }
+  if (msg?.type === "clearCache") {
+    // botão do popup: apaga o cache de notas (memória + disco).
+    // As preferências ficam no storage.sync, então não são afetadas.
+    memCache.clear();
+    chrome.storage.local
+      .clear()
+      .then(() => sendResponse({ ok: true }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
   }
 });
