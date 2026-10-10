@@ -1,35 +1,60 @@
-.rt-badge {
+/* Vale o Play? — badge nos cards, linha de notas no detalhe e filtro de qualidade.
+   Tudo com prefixo .vop- e reset próprio, pra o CSS da Netflix/Disney+ não
+   vazar pro badge (ex.: sublinhado de link, caixa alta, espaçamento). */
+
+.vop-badge,
+.vop-inline {
+  all: initial;
+  box-sizing: border-box;
+  font-family: "Netflix Sans", "Avenir Next", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-weight: 700;
+  color: #fff;
+  line-height: 1.4;
+  text-decoration: none;
+  text-transform: none;
+  letter-spacing: normal;
+  white-space: nowrap;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+.vop-badge *,
+.vop-inline * {
+  font: inherit;
+  color: inherit;
+  text-decoration: none;
+  text-transform: none;
+}
+
+/* ---- Badge na capa ---- */
+
+.vop-badge {
   position: absolute;
-  z-index: 9999;
+  z-index: 2;
   display: flex;
-  gap: 6px;
   align-items: center;
+  gap: 6px;
   border-radius: 4px;
   background: rgba(0, 0, 0, 0.78);
-  color: #fff;
-  font-family: "Netflix Sans", Helvetica, Arial, sans-serif;
-  font-weight: 700;
-  line-height: 1.4;
   pointer-events: auto;
-  user-select: none;
   /* padrão = médio + canto superior esquerdo (caso as classes faltem) */
   font-size: 11px;
   padding: 2px 6px;
-  left: 4px;
   top: 4px;
+  left: 4px;
 }
 
 /* Tamanhos (popup da extensão) */
-.rt-badge.rt-size-small {
+.vop-badge.vop-size-small {
   font-size: 9px;
   padding: 1px 4px;
   gap: 4px;
 }
-.rt-badge.rt-size-medium {
+.vop-badge.vop-size-medium {
   font-size: 11px;
   padding: 2px 6px;
 }
-.rt-badge.rt-size-large {
+.vop-badge.vop-size-large {
   font-size: 15px;
   padding: 4px 9px;
   gap: 8px;
@@ -37,100 +62,99 @@
 }
 
 /* Posições (popup da extensão) */
-.rt-badge.rt-pos-bottom-left {
-  left: 4px;
-  bottom: 4px;
-  right: auto;
-  top: auto;
-}
-.rt-badge.rt-pos-bottom-right {
-  right: 4px;
-  bottom: 4px;
-  left: auto;
-  top: auto;
-}
-.rt-badge.rt-pos-top-left {
-  left: 4px;
+.vop-badge.vop-pos-top-left {
   top: 4px;
+  left: 4px;
   right: auto;
   bottom: auto;
 }
-.rt-badge.rt-pos-top-right {
-  right: 4px;
+.vop-badge.vop-pos-top-right {
   top: 4px;
+  right: 4px;
   left: auto;
   bottom: auto;
 }
-
-.rt-badge .rt-part {
-  white-space: nowrap;
+.vop-badge.vop-pos-bottom-left {
+  bottom: 4px;
+  left: 4px;
+  top: auto;
+  right: auto;
+}
+.vop-badge.vop-pos-bottom-right {
+  bottom: 4px;
+  right: 4px;
+  top: auto;
+  left: auto;
 }
 
 /* Fontes alternativas (IMDb/TMDB): rótulo pequeno ao lado da nota */
-.rt-badge .rt-alt small {
+.vop-badge .vop-alt small,
+.vop-inline .vop-alt small {
   margin-left: 4px;
-  font-size: 0.75em;
+  font-size: 0.72em;
   font-weight: 400;
   opacity: 0.75;
   letter-spacing: 0.02em;
 }
 
-/* Filtro de qualidade: capa esmaecida quando a nota fica abaixo do corte
-   escolhido no popup. Hover devolve as cores pra não travar a navegação. */
-.rt-dim img,
-.rt-dim video {
-  filter: grayscale(0.9) brightness(0.4);
-  transition: filter 0.2s ease;
-}
-.rt-dim:hover img,
-.rt-dim:hover video {
-  filter: none;
-}
-
-/* Linha de notas perto da sinopse (visão de detalhe do título) */
-.rt-inline {
-  display: flex;
-  gap: 14px;
-  align-items: center;
-  margin: 6px 0 10px;
-  font-family: "Netflix Sans", Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  font-weight: 700;
-  color: #fff;
-}
-.rt-inline .rt-part {
-  white-space: nowrap;
-}
-.rt-inline .rt-alt small {
-  margin-left: 4px;
-  font-size: 0.7em;
-  font-weight: 400;
-  opacity: 0.75;
-}
-.rt-inline.rt-clickable {
+.vop-badge.vop-clickable {
   cursor: pointer;
 }
-.rt-inline.rt-clickable:hover {
-  text-decoration: underline;
-}
-.rt-inline.rt-top-inline .rt-trophy {
-  filter: drop-shadow(0 0 2px rgba(212, 160, 23, 0.8));
+.vop-badge.vop-clickable:hover {
+  background: rgba(0, 0, 0, 0.95);
 }
 
 /* Aclamados: RT com críticos e audiência acima de 90%, ou IMDb acima de 9,0 */
-.rt-badge.rt-top {
-  background: rgba(26, 20, 0, 0.85);
+.vop-badge.vop-top {
+  background: rgba(26, 20, 0, 0.88);
   box-shadow: 0 0 0 1px #d4a017, 0 0 8px rgba(212, 160, 23, 0.55);
 }
-
-.rt-badge .rt-trophy {
+.vop-trophy {
   filter: drop-shadow(0 0 2px rgba(212, 160, 23, 0.8));
 }
 
-.rt-badge.rt-clickable {
-  cursor: pointer;
+/* Badge dentro do modal de preview (quando não há lugar pra linha) */
+.vop-badge.vop-modal {
+  top: 10px;
+  left: 10px;
+  font-size: 14px;
+  padding: 3px 8px;
 }
 
-.rt-badge.rt-clickable:hover {
-  background: rgba(0, 0, 0, 0.95);
+/* ---- Linha de notas no detalhe do título ---- */
+
+.vop-inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  margin: 8px 0 12px;
+  font-size: 16px;
+  position: relative;
+  z-index: 2;
+}
+.vop-inline.vop-compact {
+  gap: 10px;
+  margin: 4px 0 6px;
+  font-size: 13px;
+}
+.vop-inline.vop-clickable {
+  cursor: pointer;
+}
+.vop-inline.vop-clickable:hover .vop-part:not(.vop-trophy) {
+  text-decoration: underline;
+}
+
+/* ---- Filtro de qualidade: capa esmaecida abaixo do corte ----
+   Hover devolve as cores pra não travar a navegação. */
+.vop-dim img,
+.vop-dim video,
+.vop-dim picture {
+  filter: grayscale(0.9) brightness(0.4);
+  transition: filter 0.2s ease;
+}
+.vop-dim:hover img,
+.vop-dim:hover video,
+.vop-dim:hover picture {
+  filter: none;
 }

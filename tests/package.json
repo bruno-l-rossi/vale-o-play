@@ -1,0 +1,11 @@
+{
+  "name": "vale-o-play-tests",
+  "private": true,
+  "description": "Testes automáticos da extensão Vale o Play? (não vão no pacote da loja)",
+  "scripts": {
+    "test": "node --test background.test.js content.test.js"
+  },
+  "devDependencies": {
+    "jsdom": "^24.1.3"
+  }
+}

@@ -1,361 +1,702 @@
-// Content script: acha os cards de título na Netflix (home, busca, gêneros
-// e modal de preview) e pendura o badge com as notas. Também esmaece capas
-// abaixo do corte de qualidade e mostra as notas perto da sinopse no detalhe.
+// Vale o Play? — content script (Netflix e Disney+)
+//
+// Acha os cards de título na página, pede a nota ao service worker e pendura
+// o badge na capa. Também mostra as notas em tamanho grande no detalhe do
+// título e esmaece capas abaixo do corte de qualidade escolhido no popup.
+//
+// Como a Netflix e a Disney+ trocam nomes de classe com frequência, a
+// detecção se apoia no que elas não conseguem mudar sem quebrar o próprio
+// site: os links de navegação (/browse?jbv=ID, /watch/ID, /browse/entity-ID),
+// os atributos de teste (data-uia, data-testid) e os rótulos de acessibilidade
+// (aria-label). Se um dia os badges sumirem, o lugar pra ajustar é o objeto
+// do site (NETFLIX ou DISNEY) logo abaixo; ligue o diagnóstico com
+// localStorage.setItem("valeoplay:debug", "1") no console da página.
 
-const DONE_ATTR = "data-rt-done";
-const SCAN_DEBOUNCE_MS = 600;
-const RESCAN_INTERVAL_MS = 4000; // rede de segurança pra rotas SPA e lazy load
-const LOG = "[Vale o Play?]";
+(() => {
+  "use strict";
+  if (window.__valeOPlay) return; // proteção contra injeção dupla
+  window.__valeOPlay = true;
 
-// ---- Configurações (popup): tamanho, posição e filtro de qualidade ----
-
-const DEFAULT_SETTINGS = {
-  badgeSize: "medium",
-  badgePosition: "top-left",
-  dimThreshold: "off",
-};
-let settings = { ...DEFAULT_SETTINGS };
-
-function badgeClasses() {
-  return ["rt-badge", `rt-size-${settings.badgeSize}`, `rt-pos-${settings.badgePosition}`];
-}
-
-function applySettingsToBadge(badge) {
-  const cls = badgeClasses();
-  if (badge.dataset.rtClickable === "1") cls.push("rt-clickable");
-  if (badge.dataset.rtTop === "1") cls.push("rt-top");
-  badge.className = cls.join(" ");
-}
-
-function refreshAllBadges() {
-  document.querySelectorAll(".rt-badge").forEach(applySettingsToBadge);
-}
-
-// ---- Filtro de qualidade: esmaece capas abaixo do corte ----
-
-// Nota única pra comparar com o corte: críticos do RT (ou audiência,
-// se críticos faltar); IMDb/TMDB viram % (7,4 -> 74).
-function effectiveScore(score) {
-  if (score.source === "imdb" || score.source === "tmdb") {
-    return Math.round(score.rating * 10);
+  const LOG = "[Vale o Play?]";
+  let DEBUG = false;
+  try {
+    DEBUG = localStorage.getItem("valeoplay:debug") === "1";
+  } catch (e) {
+    /* storage bloqueado */
   }
-  if (typeof score.critics === "number") return score.critics;
-  if (typeof score.audience === "number") return score.audience;
-  return null;
-}
+  const debug = (...a) => DEBUG && console.debug(LOG, ...a);
 
-function applyDim(el) {
-  const t = settings.dimThreshold;
-  const on = t !== "off" && Number(el.dataset.rtScore) < Number(t);
-  el.classList.toggle("rt-dim", on);
-}
+  // -------------------------------------------------------------------------
+  // Utilidades
+  // -------------------------------------------------------------------------
 
-function applyDimAll() {
-  document.querySelectorAll("[data-rt-score]").forEach(applyDim);
-}
+  const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-chrome.storage.sync.get(DEFAULT_SETTINGS, (stored) => {
-  settings = { ...DEFAULT_SETTINGS, ...stored };
-  refreshAllBadges();
-  applyDimAll();
-});
+  function norm(s) {
+    return clean(s)
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-z0-9 ]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
 
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "sync") return;
-  if (changes.badgeSize) settings.badgeSize = changes.badgeSize.newValue;
-  if (changes.badgePosition) settings.badgePosition = changes.badgePosition.newValue;
-  if (changes.dimThreshold) settings.dimThreshold = changes.dimThreshold.newValue;
-  refreshAllBadges();
-  applyDimAll();
-});
+  // Rótulos de botão/UI que aparecem em aria-label mas não são nome de título.
+  const UI_LABELS = new Set(
+    [
+      "reproduzir", "assistir", "play", "continuar", "continuar assistindo", "resume",
+      "mais informacoes", "more info", "informacoes", "detalhes", "details", "info",
+      "minha lista", "my list", "adicionar a minha lista", "remover da minha lista",
+      "add to my list", "remove from my list", "curtir", "like", "trailer", "episodios",
+      "episodes", "compartilhar", "share", "fechar", "close", "ver tudo", "explorar tudo",
+      "explore all", "thumbnail", "titulo", "title", "title card",
+    ].map(norm)
+  );
 
-// ---- Detecção de cards ----
+  // Interpreta um rótulo de card: tira prefixos de UI e separa o ano quando
+  // vem no formato antigo "Nome (2010) - 16+ - Filmes".
+  function parseLabel(raw) {
+    let t = clean(raw)
+      .replace(/^thumbnail\s*[-–:]\s*/i, "") // Disney+: "thumbnail - Nome"
+      .replace(/^(go to|ir para)\s+/i, ""); // Netflix pública: "Go to Nome"
+    if (!t) return null;
+    let year = null;
+    const m = /^(.+?)\s*\((\d{4})\)(?:\s*[-–—|].*)?$/.exec(t);
+    if (m) {
+      t = m[1].trim();
+      year = Number(m[2]);
+    }
+    if (t.length < 2 || UI_LABELS.has(norm(t))) return null;
+    return { title: t, year };
+  }
 
-// Resolve um nó qualquer pro "card" onde o badge vai morar, subindo pro
-// container de capa ou pra âncora mais próxima. Serve pra deduplicar: o card
-// e a âncora /watch/ dentro dele caem no mesmo root, evitando badge dobrado.
-const CARD_SELECTOR =
-  '.title-card, .title-card-container, .boxart-container, .boxart-round, [data-uia*="title-card"]';
+  // Ano e tipo (filme/série) a partir de um texto de metadados.
+  function parseMeta(text) {
+    const t = clean(text);
+    if (!t) return { year: null, type: null };
+    const y = /\b(19[2-9]\d|20[0-4]\d)\b/.exec(t);
+    let type = null;
+    if (/\b(temporadas?|seasons?|epis[oó]dios?|episodes?|miniss[eé]rie|limited series|s[eé]rie)\b/i.test(t)) type = "tv";
+    else if (/\b\d+\s*h(\s*\d+\s*min)?\b|\b\d+\s*min\b/i.test(t)) type = "movie";
+    return { year: y ? Number(y[1]) : null, type };
+  }
 
-function cardRoot(node) {
-  return node.closest?.(CARD_SELECTOR) || node.closest?.("a") || node;
-}
+  function firstLabel(sources) {
+    for (const s of sources) {
+      const p = parseLabel(s);
+      if (p) return p;
+    }
+    return null;
+  }
 
-// Junta todas as estratégias e deduplica por root, pra cobrir a home, as
-// páginas de gênero/subgênero e a busca (inclusive os resultados que
-// aparecem enquanto você digita). Cards dentro do modal de preview ficam
-// de fora: o modal tem tratamento próprio.
-function findCards() {
-  const roots = new Set();
-  const add = (n) => {
-    const r = cardRoot(n);
-    if (r && !r.closest('[class*="previewModal"]')) roots.add(r);
+  // -------------------------------------------------------------------------
+  // Adaptadores de site
+  // -------------------------------------------------------------------------
+
+  // Onde o badge mora: o próprio card, ou (se o card for um <a> "inline", que
+  // não serve de referência pra posicionar) o filho dele que contém a capa.
+  function boxOf(host) {
+    if (getComputedStyle(host).display !== "inline") return host;
+    let el = host.querySelector("img, picture, [style*='background-image']");
+    while (el && el.parentElement !== host) el = el.parentElement;
+    return el && el.nodeType === 1 ? el : host;
+  }
+
+  // ID do vídeo da Netflix em qualquer formato de link.
+  function nfId(href) {
+    const m = /(?:\/(?:watch|title)\/|[?&]jbv=)(\d{4,})/.exec(href || "");
+    return m ? m[1] : null;
+  }
+
+  const NETFLIX = {
+    id: "netflix",
+    settingKey: "enableNetflix",
+    // páginas onde não há catálogo (player): não varre, poupa CPU
+    idle: () => /^\/watch\//.test(location.pathname),
+    // Formato atual (2026): <a href="/browse?jbv=ID" data-uia="standard-card"
+    // aria-label="Nome"><img alt=""></a>. Os demais são formatos antigos e
+    // de outras áreas (busca, Minha lista, Top 10, Continuar assistindo).
+    cardSelector: [
+      'a[data-uia$="-card"]',
+      'a[href*="jbv="]',
+      'a[href*="/watch/"]',
+      'a[href*="/title/"]',
+      ".title-card",
+    ].join(","),
+    exclude: [
+      "header", "nav", "footer", '[role="dialog"]',
+      '[class*="previewModal"]', '[data-uia^="previewModal"]', '[data-uia*="mini-modal"]',
+      '[class*="mini-modal"]', ".jawBoneContainer", '[data-uia*="notification"]',
+      '[class*="buttonControls"]', '[class*="billboard"]', '[data-uia*="billboard"]',
+      '[data-uia*="episode"]', '[class*="episodeSelector"]', '[data-uia*="game"]',
+    ].join(","),
+    host(el) {
+      return el.closest(".title-card") || (el.tagName === "A" ? el : el.closest("a")) || el;
+    },
+    badgeParent(host) {
+      return host.querySelector(".boxart-container") || boxOf(host);
+    },
+    info(host) {
+      const a = host.tagName === "A" ? host : host.querySelector("a[href]");
+      const id = nfId(a && a.getAttribute("href")) || host.getAttribute("data-videoid") || null;
+      const label = firstLabel([
+        a && a.getAttribute("aria-label"),
+        host.getAttribute("aria-label"),
+        host.querySelector(".fallback-text")?.textContent,
+        host.querySelector('[data-uia="video-title"]')?.textContent,
+        host.querySelector("img[alt]")?.getAttribute("alt"),
+      ]);
+      const title = label?.title || (id && idTitles.get(id)) || null;
+      if (!title) return null;
+      return { key: `nf:${id || norm(title)}:${norm(title)}`, id, title, year: label?.year || null, type: null };
+    },
+    // Modal de preview (hover) e de detalhe (clique / ?jbv=ID).
+    details() {
+      const out = [];
+      const sel =
+        '[data-uia="previewModal--container"], .previewModal--container, [class*="previewModal--container"], .jawBoneContainer, [data-uia="detail-modal"]';
+      for (const modal of document.querySelectorAll(sel)) {
+        if (modal.parentElement && modal.parentElement.closest(sel)) continue; // aninhado
+        const isDetail =
+          /detail/i.test(modal.className) || modal.matches(".jawBoneContainer") || /[?&]jbv=/.test(location.search);
+        let id = isDetail ? nfId(location.search) : null;
+        if (!id) {
+          for (const a of modal.querySelectorAll("a[href]")) {
+            id = nfId(a.getAttribute("href"));
+            if (id) break;
+          }
+        }
+        const logo = modal.querySelector(
+          '[data-uia="previewModal--player-titleTreatment-logo"], .previewModal--player-titleTreatment-logo, img[class*="titleTreatment"], [class*="titleTreatment"] img[alt], [data-uia*="title-treatment"] img[alt]'
+        );
+        const label = firstLabel([
+          logo && (logo.getAttribute("alt") || logo.getAttribute("title") || logo.textContent),
+          modal.querySelector('[data-uia="video-title"]')?.textContent,
+          modal.querySelector('img[class*="boxart"][alt]')?.getAttribute("alt"),
+          modal.querySelector("h1")?.textContent,
+          modal.getAttribute("aria-label"),
+        ]);
+        const title = label?.title || (id && idTitles.get(id)) || null;
+        if (!title) continue;
+
+        const metaEl = modal.querySelector('[data-uia="videoMetadata--container"], .videoMetadata--container, [class*="videoMetadata--container"]');
+        const meta = parseMeta(metaEl?.textContent);
+
+        const synopsis = modal.querySelector('[data-uia="preview-modal-synopsis"], .preview-modal-synopsis, [class*="synopsis"]');
+        const detailsMeta = modal.querySelector('[data-uia="previewModal--detailsMetadata"], [class*="detailsMetadata"]');
+        let anchor = null;
+        if (synopsis) anchor = { el: synopsis, where: "before" };
+        else if (metaEl) anchor = { el: metaEl, where: "after" };
+        else if (detailsMeta) anchor = { el: detailsMeta, where: "prepend" };
+
+        out.push({
+          root: modal,
+          key: `nfd:${id || ""}:${norm(title)}`,
+          title,
+          year: label?.year || meta.year,
+          type: meta.type,
+          anchor,
+          compact: !isDetail,
+          badgeHost: anchor
+            ? null
+            : modal.querySelector('[class*="player_container"], [class*="imageWrapper"], [data-uia*="player"]'),
+        });
+      }
+      return out;
+    },
   };
 
-  document.querySelectorAll(CARD_SELECTOR).forEach(add);
-
-  // âncoras de título/assistir: é assim que a busca monta os resultados
-  document
-    .querySelectorAll('a[href*="/watch/"], a[href*="/title/"]')
-    .forEach(add);
-
-  return [...roots];
-}
-
-// Rótulos de UI que aparecem como aria-label mas não são nome de título.
-const UI_LABELS = /^(reproduzir|assistir|play|mais informações|more info|adicionar à minha lista|remover da minha lista)$/i;
-
-function cleanTitle(s) {
-  if (!s) return null;
-  const t = s.trim();
-  if (t.length < 2 || UI_LABELS.test(t)) return null;
-  return t;
-}
-
-function getTitleFromCard(card) {
-  const sources = [
-    card.getAttribute && card.getAttribute("aria-label"),
-    card.querySelector?.("a[aria-label]")?.getAttribute("aria-label"),
-    card.querySelector?.(".fallback-text")?.textContent,
-    card.querySelector?.('[data-uia="video-title"]')?.textContent,
-    card.querySelector?.("img[alt]")?.getAttribute("alt"),
-  ];
-  for (const s of sources) {
-    const t = cleanTitle(s);
-    if (t) return t;
-  }
-  return null;
-}
-
-// ---- Badge ----
-
-function fmtRating(r) {
-  return (Math.round(r * 10) / 10).toFixed(1).replace(".", ",");
-}
-
-// Destaque de aclamado: RT com críticos E audiência acima de 90%,
-// ou IMDb acima de 9,0. O badge ganha 🏆 e borda dourada.
-function isTopRated(score) {
-  if (score.source === "imdb") return score.rating > 9;
-  if (score.source === "tmdb") return false;
-  return (
-    typeof score.critics === "number" &&
-    typeof score.audience === "number" &&
-    score.critics > 90 &&
-    score.audience > 90
+  // Disney+: marcas e coleções que viram card mas não são título.
+  const DISNEY_BRANDS = new Set(
+    ["disney", "disney+", "pixar", "marvel", "star wars", "national geographic", "star", "hulu", "espn", "disney junior", "20th century studios"].map(norm)
   );
-}
 
-// Partes de HTML das notas, compartilhadas pelo badge e pela linha
-// inline da sinopse.
-function scoreParts(score) {
-  const parts = [];
-  if (score.source === "imdb") {
-    parts.push(
-      `<span class="rt-part rt-alt" title="Nota IMDb (0 a 10)">⭐ ${fmtRating(score.rating)}<small>IMDb</small></span>`
-    );
-  } else if (score.source === "tmdb") {
-    parts.push(
-      `<span class="rt-part rt-alt" title="Nota de usuários do TMDB (0 a 10)">★ ${fmtRating(score.rating)}<small>TMDB</small></span>`
-    );
-  } else {
-    // Rotten Tomatoes (source "rt" ou cache antigo sem source)
-    if (score.critics !== null && score.critics !== undefined) {
-      const icon = score.critics >= 60 ? "🍅" : "🟢";
-      parts.push(`<span class="rt-part" title="Críticos">${icon} ${score.critics}%</span>`);
-    }
-    if (score.audience !== null && score.audience !== undefined) {
-      const icon = score.audience >= 60 ? "🍿" : "🥤";
-      parts.push(`<span class="rt-part" title="Audiência">${icon} ${score.audience}%</span>`);
-    }
+  function dpId(href) {
+    const m =
+      /\/browse\/entity-([0-9a-f-]{8,})/i.exec(href || "") ||
+      /\/(?:movies|series)\/[^/]+\/([0-9a-zA-Z]{8,})/.exec(href || "");
+    return m ? m[1] : null;
   }
-  return parts;
-}
 
-function makeClickable(el, url) {
-  if (!url) return;
-  el.dataset.rtClickable = "1";
-  el.addEventListener("click", (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    window.open(url, "_blank", "noopener");
-  });
-}
-
-function buildBadge(score) {
-  const parts = scoreParts(score);
-  if (!parts.length) return null;
-
-  const badge = document.createElement("div");
-  if (isTopRated(score)) {
-    badge.dataset.rtTop = "1";
-    parts.unshift(
-      `<span class="rt-part rt-trophy" title="Aclamado: nota altíssima de críticos e audiência">🏆</span>`
-    );
+  // "Assistir a Os Simpsons | Disney+" -> "Os Simpsons"
+  function disneyDocTitle() {
+    const t = clean(document.title)
+      .replace(/\s*[|·–—-]\s*Disney\+.*$/i, "")
+      .replace(/^(assistir|assista|watch|ver|mira)\s+((a|ao|à|aos|às)\s+)?/i, "");
+    return t && !/^disney\+?$/i.test(t) ? t : null;
   }
-  badge.innerHTML = parts.join("");
-  makeClickable(badge, score.url);
-  applySettingsToBadge(badge);
-  return badge;
-}
 
-function requestScore(title) {
-  return new Promise((resolve) => {
-    try {
-      chrome.runtime.sendMessage({ type: "getScore", title }, (res) => {
-        if (chrome.runtime.lastError) {
-          console.warn(LOG, "erro de mensagem:", chrome.runtime.lastError.message);
-          return resolve(null);
-        }
-        resolve(res && res.ok ? res.value : null);
+  const DISNEY = {
+    id: "disney",
+    settingKey: "enableDisney",
+    idle: () => /\/(play|video)\//.test(location.pathname),
+    cardSelector: 'a[href*="/browse/entity-"], a[data-item-id], a[href*="/movies/"], a[href*="/series/"]',
+    exclude: [
+      "header", "nav", "footer", '[data-testid*="brand"]', '[data-testid*="cta"]', '[role="dialog"]',
+    ].join(","),
+    host(el) {
+      return el.tagName === "A" ? el : el.closest("a");
+    },
+    badgeParent(host) {
+      return boxOf(host);
+    },
+    info(host) {
+      const id = dpId(host.getAttribute("href")) || host.getAttribute("data-item-id") || null;
+      const fromAlt = parseLabel(host.querySelector("img[alt]")?.getAttribute("alt"));
+      const fromAria = parseLabel(host.getAttribute("aria-label"));
+      // aria-label às vezes traz texto extra depois do nome: fica o mais curto
+      let label = fromAria || fromAlt;
+      if (fromAlt && fromAria && norm(fromAria.title).startsWith(norm(fromAlt.title))) label = fromAlt;
+      if (!label || DISNEY_BRANDS.has(norm(label.title))) return null;
+      return { key: `dp:${id || ""}:${norm(label.title)}`, id, title: label.title, year: label.year, type: null };
+    },
+    // Página de detalhe: /browse/entity-<id>
+    details() {
+      const id = dpId(location.pathname);
+      if (!id) return [];
+      const hero = document.querySelector('[data-testid="hero"]');
+      const h1 = document.querySelector('h1[data-testid="content-title"]') || document.querySelector("main h1");
+      const logo =
+        (hero && hero.querySelector('img[alt]:not([alt=""])')) ||
+        document.querySelector('[data-testid*="title-treatment"] img[alt], img[data-testid*="title"][alt]');
+      const label = firstLabel([h1?.textContent, logo?.getAttribute("alt"), disneyDocTitle()]);
+      if (!label || DISNEY_BRANDS.has(norm(label.title))) return [];
+
+      const metaEl = document.querySelector('[data-testid="masthead-metadata"], [data-testid*="metadata"]');
+      const meta = parseMeta(metaEl?.textContent || hero?.textContent?.slice(0, 400));
+
+      let anchor = null;
+      if (metaEl) anchor = { el: metaEl, where: "after" };
+      else if (logo) anchor = { el: logo.parentElement || logo, where: "after" };
+      else if (h1) anchor = { el: h1, where: "after" };
+      else if (hero) anchor = { el: hero, where: "prepend" };
+      if (!anchor) return [];
+
+      return [
+        {
+          root: document.querySelector("main") || document.body,
+          key: `dpd:${id}:${norm(label.title)}`,
+          title: label.title,
+          year: label.year || meta.year,
+          type: meta.type,
+          anchor,
+          compact: false,
+          badgeHost: null,
+        },
+      ];
+    },
+  };
+
+  const SITE = /(^|\.)netflix\.com$/.test(location.hostname)
+    ? NETFLIX
+    : /(^|\.)disneyplus\.com$/.test(location.hostname)
+      ? DISNEY
+      : null;
+  if (!SITE) return;
+
+  // -------------------------------------------------------------------------
+  // Configurações (popup)
+  // -------------------------------------------------------------------------
+
+  const DEFAULT_SETTINGS = {
+    badgeSize: "medium",
+    badgePosition: "top-left",
+    dimThreshold: "off",
+    enableNetflix: true,
+    enableDisney: true,
+  };
+  let settings = { ...DEFAULT_SETTINGS };
+  let enabled = false;
+
+  // -------------------------------------------------------------------------
+  // Notas: pedido ao service worker com memo por página
+  // -------------------------------------------------------------------------
+
+  const idTitles = new Map(); // ID do vídeo -> nome (ajuda o modal a se achar)
+  const memo = new Map(); // título|tipo|ano -> Promise<nota|null|undefined>
+  let dead = false; // extensão recarregada: este script ficou órfão
+
+  function requestScore(q, priority) {
+    const k = `${norm(q.title)}|${q.type || ""}|${q.year || ""}`;
+    if (memo.has(k)) return memo.get(k);
+    const p = new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage(
+          { type: "getScore", title: q.title, year: q.year || null, mediaType: q.type || null, priority },
+          (res) => {
+            const err = chrome.runtime.lastError;
+            if (err || !res) {
+              debug("falha ao pedir nota:", err?.message);
+              return resolve(undefined); // undefined = tenta de novo depois
+            }
+            resolve(res.ok ? res.value : undefined);
+          }
+        );
+      } catch (e) {
+        if (/context invalidated/i.test(e.message)) shutdown();
+        resolve(undefined);
+      }
+    });
+    memo.set(k, p);
+    p.then((v) => {
+      if (v === undefined) memo.delete(k);
+    });
+    return p;
+  }
+
+  // -------------------------------------------------------------------------
+  // Badge e linha de notas
+  // -------------------------------------------------------------------------
+
+  const fmtRating = (r) => (Math.round(r * 10) / 10).toFixed(1).replace(".", ",");
+
+  // Nota única pra comparar com o corte: críticos do RT (ou audiência na
+  // falta); IMDb/TMDB viram % (7,4 -> 74).
+  function effectiveScore(s) {
+    if (s.source === "imdb" || s.source === "tmdb") return Math.round(s.rating * 10);
+    if (typeof s.critics === "number") return s.critics;
+    if (typeof s.audience === "number") return s.audience;
+    return null;
+  }
+
+  // Aclamado: RT com críticos E audiência acima de 90%, ou IMDb acima de 9,0.
+  function isTopRated(s) {
+    if (s.source === "imdb") return s.rating > 9;
+    if (s.source !== "rt") return false;
+    return s.critics > 90 && s.audience > 90;
+  }
+
+  function scoreParts(s) {
+    const parts = [];
+    if (s.source === "imdb" || s.source === "tmdb") {
+      const imdb = s.source === "imdb";
+      parts.push({
+        icon: imdb ? "⭐" : "★",
+        text: fmtRating(s.rating),
+        label: imdb ? "IMDb" : "TMDB",
+        tip: imdb ? "Nota IMDb (0 a 10)" : "Nota de usuários do TMDB (0 a 10)",
       });
-    } catch (e) {
-      console.warn(LOG, "exceção ao pedir nota:", e.message);
-      resolve(null);
+    } else {
+      if (typeof s.critics === "number") {
+        parts.push({
+          icon: s.critics >= 60 ? "🍅" : "🟢",
+          text: `${s.critics}%`,
+          tip: s.certified ? "Críticos (Certified Fresh)" : "Críticos (Tomatometer)",
+        });
+      }
+      if (typeof s.audience === "number") {
+        parts.push({ icon: s.audience >= 60 ? "🍿" : "🥤", text: `${s.audience}%`, tip: "Audiência (Popcornmeter)" });
+      }
     }
-  });
-}
+    if (parts.length && isTopRated(s)) {
+      parts.unshift({ icon: "🏆", text: "", tip: "Aclamado: nota altíssima de críticos e audiência", trophy: true });
+    }
+    return parts;
+  }
 
-async function attachBadge(container, title, opts) {
-  const score = await requestScore(title);
-  if (!score) return;
+  function sourceName(s) {
+    return s.source === "imdb" ? "IMDb" : s.source === "tmdb" ? "TMDB" : "Rotten Tomatoes";
+  }
 
-  // container pode ter sido removido do DOM enquanto a nota chegava
-  if (!container.isConnected) return;
+  function fillParts(el, s) {
+    for (const p of scoreParts(s)) {
+      const span = document.createElement("span");
+      span.className = "vop-part" + (p.trophy ? " vop-trophy" : "") + (p.label ? " vop-alt" : "");
+      span.title = p.tip;
+      span.textContent = p.text ? `${p.icon} ${p.text}` : p.icon;
+      if (p.label) {
+        const small = document.createElement("small");
+        small.textContent = p.label;
+        span.appendChild(small);
+      }
+      el.appendChild(span);
+    }
+    el.title = `${sourceName(s)}${s.match ? ` · ${s.match}` : ""}${s.url ? " · clique pra abrir" : ""}`;
+    if (s.url) {
+      el.classList.add("vop-clickable");
+      const stop = (e) => e.stopPropagation();
+      // não deixa o clique cair no card (que abriria o título no streaming)
+      for (const ev of ["pointerdown", "mousedown", "pointerup", "mouseup"]) el.addEventListener(ev, stop);
+      el.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        window.open(s.url, "_blank", "noopener");
+      });
+    }
+    return el.childNodes.length > 0;
+  }
 
-  // filtro de qualidade: marca a nota no card e esmaece se estiver
-  // abaixo do corte (só nos cards; modal de preview fica intacto)
-  if (opts?.dim) {
-    const eff = effectiveScore(score);
+  function badgeClass(extra) {
+    return `vop-badge vop-size-${settings.badgeSize} vop-pos-${settings.badgePosition}${extra || ""}`;
+  }
+
+  function buildBadge(s) {
+    const badge = document.createElement("div");
+    badge.dataset.vopTop = isTopRated(s) ? "1" : "";
+    if (!fillParts(badge, s)) return null;
+    badge.className = badgeClass(badge.classList.contains("vop-clickable") ? " vop-clickable" : "");
+    if (badge.dataset.vopTop) badge.classList.add("vop-top");
+    return badge;
+  }
+
+  function refreshBadgeClasses() {
+    document.querySelectorAll(".vop-badge").forEach((b) => {
+      const clickable = b.classList.contains("vop-clickable");
+      b.className = badgeClass(clickable ? " vop-clickable" : "");
+      if (b.dataset.vopTop) b.classList.add("vop-top");
+    });
+  }
+
+  function applyDim(host) {
+    const t = settings.dimThreshold;
+    const score = Number(host.dataset.vopScore);
+    host.classList.toggle("vop-dim", t !== "off" && Number.isFinite(score) && score < Number(t));
+  }
+
+  function applyDimAll() {
+    document.querySelectorAll("[data-vop-score]").forEach(applyDim);
+  }
+
+  // -------------------------------------------------------------------------
+  // Cards: varredura + carga preguiçosa (só o que está perto da tela)
+  // -------------------------------------------------------------------------
+
+  const pending = new WeakMap(); // host -> info aguardando ficar visível
+  const retries = new Map(); // chave -> tentativas após falha de mensagem
+  const io =
+    "IntersectionObserver" in window
+      ? new IntersectionObserver(onIntersect, { rootMargin: "400px 800px" })
+      : null;
+
+  function onIntersect(entries) {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      io.unobserve(e.target);
+      loadCard(e.target);
+    }
+  }
+
+  function clearHost(host) {
+    host.querySelectorAll(".vop-badge").forEach((b) => b.remove());
+    host.classList.remove("vop-dim");
+    delete host.dataset.vopScore;
+  }
+
+  async function loadCard(host) {
+    const info = pending.get(host);
+    if (!info) return;
+    pending.delete(host);
+    const s = await requestScore(info, "normal");
+    if (host.dataset.vopKey !== info.key || !host.isConnected) return; // card mudou
+    if (s === undefined) return retryLater(host, info);
+    if (!s) return;
+
+    const eff = effectiveScore(s);
     if (eff !== null) {
-      container.dataset.rtScore = eff;
-      applyDim(container);
+      host.dataset.vopScore = String(eff);
+      applyDim(host);
+    }
+    const parent = SITE.badgeParent(host);
+    host.querySelectorAll(".vop-badge").forEach((b) => b.remove());
+    const badge = buildBadge(s);
+    if (!badge) return;
+    if (getComputedStyle(parent).position === "static") parent.style.position = "relative";
+    parent.appendChild(badge);
+  }
+
+  function retryLater(host, info) {
+    const n = (retries.get(info.key) || 0) + 1;
+    retries.set(info.key, n);
+    if (n > 3) return;
+    setTimeout(() => {
+      if (host.dataset.vopKey === info.key) delete host.dataset.vopKey;
+      scheduleScan();
+    }, 3000 * n);
+  }
+
+  function hasImage(host) {
+    return !!host.querySelector("img, picture, [style*='background-image']");
+  }
+
+  let lastCount = -1;
+  function scanCards() {
+    const seen = new Set();
+    let count = 0;
+    for (const el of document.querySelectorAll(SITE.cardSelector)) {
+      if (el.closest(SITE.exclude)) continue;
+      const host = SITE.host(el);
+      if (!host || seen.has(host)) continue;
+      seen.add(host);
+      if (!hasImage(host)) continue; // ainda carregando (ou não é card)
+      const info = SITE.info(host);
+      if (!info) continue;
+      count++;
+      if (info.id) idTitles.set(info.id, info.title);
+      if (host.dataset.vopKey === info.key) continue; // já tratado
+      if (host.dataset.vopKey) clearHost(host); // card reciclado com outro título
+      host.dataset.vopKey = info.key;
+      pending.set(host, info);
+      if (io) io.observe(host);
+      else loadCard(host);
+    }
+    if (count !== lastCount) {
+      lastCount = count;
+      debug(`${count} cards detectados em ${location.pathname}`);
+      if (count === 0 && SITE === NETFLIX && /^\/(browse|search|latest|my-list)/.test(location.pathname)) {
+        debug("nenhum card encontrado: a estrutura da página pode ter mudado.");
+      }
     }
   }
 
-  if (container.querySelector(":scope > .rt-badge")) return;
-  const badge = buildBadge(score);
-  if (!badge) return;
+  // -------------------------------------------------------------------------
+  // Detalhe do título: linha de notas grande perto da sinopse
+  // -------------------------------------------------------------------------
 
-  if (getComputedStyle(container).position === "static") {
-    container.style.position = "relative";
-  }
-  container.appendChild(badge);
-}
+  async function processDetail(d) {
+    const { root } = d;
+    if (root.dataset.vopDetail === d.key) return;
+    root.dataset.vopDetail = d.key;
+    root.querySelectorAll(".vop-inline, .vop-badge.vop-modal").forEach((x) => x.remove());
 
-async function processCard(card) {
-  if (card.hasAttribute(DONE_ATTR)) return;
-  card.setAttribute(DONE_ATTR, "1");
-
-  const title = getTitleFromCard(card);
-  if (!title) {
-    // sem título ainda (card carregando); libera pra tentar de novo no próximo scan
-    card.removeAttribute(DONE_ATTR);
-    return;
-  }
-  await attachBadge(card, title, { dim: true });
-}
-
-// ---- Modal de preview (hover no card e visão de detalhe) ----
-
-function getTitleFromModal(modal) {
-  const sources = [
-    modal.querySelector?.('[class*="titleTreatment"] img[alt]')?.getAttribute("alt"),
-    modal.querySelector?.('img[class*="boxart"][alt]')?.getAttribute("alt"),
-    modal.querySelector?.('[data-uia="video-title"]')?.textContent,
-    modal.querySelector?.("img[alt]")?.getAttribute("alt"),
-  ];
-  for (const s of sources) {
-    const t = cleanTitle(s);
-    if (t) return t;
-  }
-  return null;
-}
-
-// Linha de notas perto da sinopse, na visão de detalhe do título.
-async function attachInline(modal, title) {
-  if (modal.getAttribute("data-rt-inline")) return;
-  const synopsis = modal.querySelector(
-    '.preview-modal-synopsis, [data-uia="preview-modal-synopsis"], [class*="synopsis"]'
-  );
-  if (!synopsis) return; // detalhe ainda não abriu; tenta no próximo scan
-  modal.setAttribute("data-rt-inline", "1");
-
-  const score = await requestScore(title);
-  if (!score) return;
-
-  const parts = scoreParts(score);
-  if (!parts.length) return;
-
-  const row = document.createElement("div");
-  row.className = "rt-inline" + (isTopRated(score) ? " rt-top-inline" : "");
-  if (isTopRated(score)) {
-    parts.unshift(
-      `<span class="rt-part rt-trophy" title="Aclamado: nota altíssima de críticos e audiência">🏆</span>`
-    );
-  }
-  row.innerHTML = parts.join("");
-  makeClickable(row, score.url);
-  if (score.url) row.classList.add("rt-clickable");
-
-  if (!synopsis.isConnected || synopsis.parentElement.querySelector(".rt-inline")) return;
-  synopsis.parentElement.insertBefore(row, synopsis);
-}
-
-function processPreviewModals() {
-  const modals = document.querySelectorAll(
-    '.previewModal--container, [class*="previewModal--container"]'
-  );
-  modals.forEach((modal) => {
-    const title = getTitleFromModal(modal);
-    if (!title) return; // modal ainda montando; tenta no próximo scan
-
-    if (!modal.hasAttribute(DONE_ATTR)) {
-      modal.setAttribute(DONE_ATTR, "1");
-      // pendura no player/imagem do topo do modal; senão, no próprio modal
-      const container =
-        modal.querySelector('[class*="player_container"], [class*="imageWrapper"]') ||
-        modal;
-      attachBadge(container, title);
+    const s = await requestScore(d, "high");
+    if (root.dataset.vopDetail !== d.key || !root.isConnected) return;
+    if (s === undefined) {
+      delete root.dataset.vopDetail; // tenta de novo na próxima varredura
+      return;
     }
+    if (!s) return;
 
-    // a sinopse carrega depois do modal; esta chamada é idempotente
-    attachInline(modal, title);
+    if (d.anchor && d.anchor.el.isConnected) {
+      const row = document.createElement("div");
+      row.className = "vop-inline" + (d.compact ? " vop-compact" : "") + (isTopRated(s) ? " vop-top-inline" : "");
+      if (!fillParts(row, s)) return;
+      root.querySelectorAll(".vop-inline").forEach((x) => x.remove());
+      const { el, where } = d.anchor;
+      if (where === "before") el.parentElement.insertBefore(row, el);
+      else if (where === "after") el.insertAdjacentElement("afterend", row);
+      else el.insertAdjacentElement("afterbegin", row);
+    } else if (d.badgeHost && d.badgeHost.isConnected) {
+      const badge = buildBadge(s);
+      if (!badge) return;
+      badge.classList.add("vop-modal");
+      if (getComputedStyle(d.badgeHost).position === "static") d.badgeHost.style.position = "relative";
+      d.badgeHost.appendChild(badge);
+    }
+  }
+
+  function scanDetails() {
+    for (const d of SITE.details()) processDetail(d);
+  }
+
+  // -------------------------------------------------------------------------
+  // Laço: MutationObserver com debounce + rede de segurança leve
+  // -------------------------------------------------------------------------
+
+  let scanTimer = null;
+  let firstPendingAt = 0;
+
+  function scan() {
+    scanTimer = null;
+    firstPendingAt = 0;
+    if (!enabled || dead || SITE.idle()) return;
+    try {
+      scanCards();
+      scanDetails();
+    } catch (e) {
+      console.warn(LOG, "erro na varredura:", e);
+    }
+  }
+
+  // debounce de 250ms, mas nunca segura mais de 1s em página que não para
+  function scheduleScan() {
+    if (!enabled || dead) return;
+    const now = Date.now();
+    if (!firstPendingAt) firstPendingAt = now;
+    if (scanTimer) clearTimeout(scanTimer);
+    scanTimer = setTimeout(scan, now - firstPendingAt > 1000 ? 0 : 250);
+  }
+
+  const isOurs = (n) => n.nodeType === 1 && (n.classList.contains("vop-badge") || n.classList.contains("vop-inline"));
+
+  const observer = new MutationObserver((mutations) => {
+    if (SITE.idle()) return;
+    for (const m of mutations) {
+      if (m.type === "attributes") return scheduleScan();
+      for (const n of m.addedNodes) if (!isOurs(n)) return scheduleScan();
+      for (const n of m.removedNodes) if (!isOurs(n)) return scheduleScan();
+    }
   });
-}
 
-// ---- Loop de varredura ----
+  let safetyTimer = null;
 
-let lastCount = -1;
-function scan() {
-  const all = findCards();
-  const fresh = all.filter((c) => !c.hasAttribute(DONE_ATTR));
-  if (all.length !== lastCount) {
-    lastCount = all.length;
-    console.info(LOG, `${all.length} cards detectados, ${fresh.length} novos`);
-    if (all.length === 0) {
-      console.warn(
-        LOG,
-        "nenhum card encontrado. A estrutura da página da Netflix pode ter mudado; reporte este aviso."
-      );
+  function start() {
+    if (enabled || dead) return;
+    enabled = true;
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["href", "aria-label"],
+    });
+    // rede de segurança: navegação SPA que não mexe no DOM observado
+    safetyTimer = setInterval(() => {
+      if (document.visibilityState === "visible") scheduleScan();
+    }, 5000);
+    scheduleScan();
+    debug(`ativo em ${SITE.id}`);
+  }
+
+  function stop() {
+    enabled = false;
+    observer.disconnect();
+    if (io) io.disconnect();
+    clearInterval(safetyTimer);
+    clearTimeout(scanTimer);
+    document.querySelectorAll(".vop-badge, .vop-inline").forEach((x) => x.remove());
+    document.querySelectorAll("[data-vop-key], [data-vop-detail], [data-vop-score]").forEach((el) => {
+      delete el.dataset.vopKey;
+      delete el.dataset.vopDetail;
+      delete el.dataset.vopScore;
+      el.classList.remove("vop-dim");
+    });
+  }
+
+  function shutdown() {
+    if (dead) return;
+    dead = true;
+    stop();
+    debug("extensão recarregada; recarregue a página pra voltar a ver as notas.");
+  }
+
+  // Reprocessa tudo (cache limpo no popup).
+  function resetAll() {
+    memo.clear();
+    retries.clear();
+    if (enabled) {
+      stop();
+      start();
     }
   }
-  fresh.forEach(processCard);
-  processPreviewModals();
-}
 
-let scanTimer = null;
-function scheduleScan() {
-  if (scanTimer) clearTimeout(scanTimer);
-  scanTimer = setTimeout(scan, SCAN_DEBOUNCE_MS);
-}
+  function syncEnabled() {
+    if (settings[SITE.settingKey] !== false) start();
+    else stop();
+  }
 
-console.info(LOG, "extensão carregada nesta página");
-const observer = new MutationObserver(scheduleScan);
-observer.observe(document.body, { childList: true, subtree: true });
+  chrome.storage.sync.get(DEFAULT_SETTINGS, (stored) => {
+    settings = { ...DEFAULT_SETTINGS, ...(stored || {}) };
+    syncEnabled();
+  });
 
-// varredura periódica: pega navegação SPA (busca, gêneros) e lazy load
-// que às vezes escapam do debounce do MutationObserver
-setInterval(scan, RESCAN_INTERVAL_MS);
-
-scheduleScan();
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes["vop:clearedAt"]) return resetAll();
+    if (area !== "sync") return;
+    for (const k of Object.keys(DEFAULT_SETTINGS)) {
+      if (changes[k]) settings[k] = changes[k].newValue ?? DEFAULT_SETTINGS[k];
+    }
+    if (changes.badgeSize || changes.badgePosition) refreshBadgeClasses();
+    if (changes.dimThreshold) applyDimAll();
+    if (changes[SITE.settingKey]) syncEnabled();
+  });
+})();

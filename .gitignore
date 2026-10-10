@@ -1,3 +1,6 @@
 vale-o-play.zip
 vale-o-play-store.zip
 .fuse_hidden*
+.DS_Store
+tests/node_modules/
+tests/package-lock.json
