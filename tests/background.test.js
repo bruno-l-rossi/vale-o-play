@@ -168,7 +168,7 @@ test("pipeline: cache em memória/disco e deduplicação de pedidos simultâneos
   const n = bg.calls.length;
   await bg.send({ type: "getScore", title: "O Poderoso Chefão" });
   assert.equal(bg.calls.length, n, "segunda chamada não vai pra rede");
-  const keys = Object.keys(bg.store).filter((k) => k.startsWith("v8:"));
+  const keys = Object.keys(bg.store).filter((k) => k.startsWith("v9:"));
   assert.equal(keys.length, 1);
   assert.ok(bg.store[keys[0]].expires > Date.now() + 6 * 24 * 3600 * 1000);
 });
@@ -248,13 +248,13 @@ test("pruneCache tira versão antiga e vencido, mantém o válido", async () => 
   const bg = loadBackground();
   Object.assign(bg.store, {
     "v6:x": { value: 1, expires: Date.now() + 1e9 },
-    "v8:vencido": { value: 1, expires: Date.now() - 1 },
-    "v8:ok": { value: 1, expires: Date.now() + 1e9 },
+    "v9:vencido": { value: 1, expires: Date.now() - 1 },
+    "v9:ok": { value: 1, expires: Date.now() + 1e9 },
     "vop:clearedAt": 1,
     "vop:algolia": { aId: "X", sId: "y" },
   });
   await bg.run("pruneCache()");
-  assert.deepEqual(Object.keys(bg.store).sort(), ["v8:ok", "vop:algolia", "vop:clearedAt"]);
+  assert.deepEqual(Object.keys(bg.store).sort(), ["v9:ok", "vop:algolia", "vop:clearedAt"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -389,7 +389,7 @@ test("Wikidata no limite de ritmo (429): tenta de novo uma vez e não marca erro
   const res = await bg.send({ type: "getScore", title: "Round 6" });
   assert.equal(n, 2);
   assert.equal(res.value.url, "https://www.rottentomatoes.com/tv/squid_game");
-  const entry = Object.entries(bg.store).find(([k]) => k.startsWith("v8:"))[1];
+  const entry = Object.entries(bg.store).find(([k]) => k.startsWith("v9:"))[1];
   assert.ok(entry.expires > Date.now() + 6 * 24 * 3600 * 1000, "cache cheio de 7 dias");
 });
 
@@ -550,4 +550,136 @@ test("homônimo sem saber o serviço (ou fora de empate): não consulta disponib
   const detail = loadBackground({ routes: animalKingdomRoutes() });
   await detail.send({ type: "getScore", title: "Animal Kingdom", year: 2016, mediaType: "tv", site: "netflix" });
   assert.ok(!detail.calls.some((u) => u.includes("watch/providers")), "ano e tipo já desempatam");
+});
+
+// ---------------------------------------------------------------------------
+// v3.2: código do título da Netflix, lotes e cache por idade
+// ---------------------------------------------------------------------------
+
+// Wikidata que responde a lista de chaves (VALUES) pedida na consulta.
+function wikidataByKey(table) {
+  return (url) => {
+    const q = decodeURIComponent(url.split("query=")[1] || "");
+    const keys = [...q.matchAll(/"([a-z]+:[^"]+)"\)/g)].map((m) => m[1]);
+    const bindings = [];
+    for (const k of keys) {
+      const row = table[k];
+      if (!row) continue;
+      bindings.push({
+        key: { value: k },
+        ...(row.rt ? { rt: { value: row.rt } } : {}),
+        ...(row.label ? { label: { value: row.label } } : {}),
+        ...(row.year ? { year: { value: String(row.year) } } : {}),
+      });
+    }
+    return { json: { results: { bindings } } };
+  };
+}
+
+// Índice do RT que responde cada busca do POST pelo título exato.
+function algoliaByTitle(hitsList) {
+  return (url, init) => {
+    const reqs = JSON.parse(init.body).requests;
+    return {
+      json: {
+        results: reqs.map((r) => {
+          const q = new URLSearchParams(r.params).get("query");
+          return { hits: hitsList.filter((h) => h.title === q) };
+        }),
+      },
+    };
+  };
+}
+
+test("Netflix: o código do card vai direto ao RT pelo Wikidata, sem TMDB", async () => {
+  const bg = loadBackground({
+    routes: {
+      "query.wikidata.org": wikidataByKey({ "nf:81040344": { rt: "tv/squid_game", label: "Squid Game", year: 2021 } }),
+      "algolia.net": algoliaByTitle([hit({ title: "Squid Game", type: "tv", year: 2021, vanity: "squid_game", critics: 86, audience: 67 })]),
+    },
+  });
+  const res = await bg.send({ type: "getScore", title: "Round 6", site: "netflix", nfId: "81040344" });
+  assert.equal(res.value.url, "https://www.rottentomatoes.com/tv/squid_game");
+  assert.equal(res.value.critics, 86);
+  assert.equal(res.value.match, "Squid Game (2021)");
+  assert.ok(!bg.calls.some((u) => u.includes("themoviedb")), "nenhuma chamada ao TMDB");
+  assert.ok(!bg.calls.some((u) => u.includes("rottentomatoes.com/tv/")), "nem à página do RT");
+  assert.ok(Object.keys(bg.store).includes("v9:nf:81040344"), "cache pelo código");
+});
+
+test("Netflix: código que o Wikidata não conhece cai no caminho por nome", async () => {
+  const routes = squidRoutes();
+  routes["query.wikidata.org"] = (url) => (decodeURIComponent(url).includes("nf:") ? { json: { results: { bindings: [] } } } : wikidata("tv/squid_game"));
+  const bg = loadBackground({ routes });
+  const res = await bg.send({ type: "getScore", title: "Round 6", site: "netflix", nfId: "99999999" });
+  assert.equal(res.value.url, "https://www.rottentomatoes.com/tv/squid_game");
+  assert.ok(bg.calls.some((u) => u.includes("themoviedb")));
+});
+
+test("lote: 30 cards da Netflix = 2 consultas ao Wikidata (lotes de 25) e 1 POST ao índice", async () => {
+  const table = {};
+  const hits = [];
+  for (let i = 0; i < 30; i++) {
+    table[`nf:8000${1000 + i}`] = { rt: `m/filme_${i}`, label: `Filme ${i}`, year: 2010 };
+    hits.push(hit({ title: `Filme ${i}`, type: "movie", year: 2010, vanity: `filme_${i}`, critics: 50 + i, audience: 60 }));
+  }
+  const bg = loadBackground({ routes: { "query.wikidata.org": wikidataByKey(table), "algolia.net": algoliaByTitle(hits) } });
+  const res = await Promise.all(
+    Object.keys(table).map((k, i) => bg.send({ type: "getScore", title: `Título ${i}`, site: "netflix", nfId: k.slice(3) }))
+  );
+  assert.equal(res.filter((r) => r.value?.source === "rt").length, 30);
+  assert.equal(res[7].value.critics, 57);
+  assert.equal(bg.calls.filter((u) => u.includes("wikidata")).length, 2);
+  assert.equal(bg.calls.filter((u) => u.includes("algolia")).length, 1);
+});
+
+test("validade pela idade do título", () => {
+  const bg = loadBackground();
+  const ttl = (v, t = false) => bg.ctx.ttlFor(v, t) / (24 * 3600 * 1000);
+  const y = new Date().getFullYear();
+  assert.equal(ttl({ source: "rt", year: y }), 2);
+  assert.equal(ttl({ source: "rt", year: y - 3 }), 7);
+  assert.equal(ttl({ source: "rt", year: 1972 }), 30);
+  assert.equal(ttl({ source: "imdb", year: 1972 }), 3);
+  assert.equal(ttl(null), 1);
+  assert.ok(ttl(null, true) < 0.02, "falha de rede: 15 min");
+});
+
+test("nota vencida volta na hora e atualiza por trás", async () => {
+  let critics = 97;
+  const routes = godfatherRoutes();
+  routes["rottentomatoes.com/m/the_godfather"] = () => ({ text: rtPageFor(critics) });
+  const bg = loadBackground({ routes });
+  const key = "v9:o poderoso chefao|||";
+  bg.store[key] = {
+    value: { source: "rt", critics: 90, audience: 90, url: "x", year: 1972 },
+    expires: Date.now() - 1000,
+    stale: Date.now() + 1e9,
+  };
+  critics = 97;
+  const first = await bg.send({ type: "getScore", title: "O Poderoso Chefão" });
+  assert.equal(first.value.critics, 90, "devolve a antiga sem esperar");
+  await new Promise((r) => setTimeout(r, 300)); // lotes esperam ~50ms pra juntar pedidos
+  const second = await bg.send({ type: "getScore", title: "O Poderoso Chefão" });
+  assert.equal(second.value.critics, 97, "a atualização em segundo plano já entrou");
+});
+
+function rtPageFor(critics) {
+  return rtPage({ critics, audience: 98 });
+}
+
+test("Wikidata com 2 endereços da mesma obra (um vazio): fica com o que tem nota", async () => {
+  const routes = {
+    "search/multi": tmdbSearch([{ id: 4574, media_type: "tv", name: "X-Men", original_name: "X-Men", first_air_date: "1992-10-31", vote_count: 900, popularity: 20 }]),
+    ...tmdbTv(4574, { en: "X-Men", year: 1992, imdb: "tt0103584" }),
+    // a página vazia vem primeiro (a ordem do Wikidata não é garantida)
+    "query.wikidata.org": wikidata("tv/x_men_1992", "tv/x_men"),
+    "algolia.net": algolia(hit({ title: "X-Men", type: "tv", year: 1992, vanity: "x_men", critics: 83, audience: 87 })),
+    "rottentomatoes.com/tv/x_men_1992": { text: rtPage({ critics: null, audience: null }) },
+  };
+  const bg = loadBackground({ routes });
+  const res = await bg.send({ type: "getScore", title: "X-Men", site: "disney" });
+  assert.equal(res.value.url, "https://www.rottentomatoes.com/tv/x_men");
+  assert.equal(res.value.critics, 83);
+  assert.ok(!bg.calls.some((u) => u.includes("x_men_1992")), "o índice já mostrou qual tem nota");
 });

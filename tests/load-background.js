@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
 
-function loadBackground({ routes = {}, onFetch } = {}) {
+function loadBackground({ routes = {}, onFetch, realFetch } = {}) {
   const store = {};
   const listeners = [];
   const calls = [];
@@ -45,7 +45,7 @@ function loadBackground({ routes = {}, onFetch } = {}) {
     return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
   }
   const ctx = vm.createContext({
-    chrome, fetch, console, setTimeout, clearTimeout, URLSearchParams, AbortController, Promise, Date,
+    chrome, fetch: realFetch || fetch, console, setTimeout, clearTimeout, URLSearchParams, AbortController, Promise, Date,
   });
   const src = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
   vm.runInContext(src, ctx, { filename: "background.js" });

@@ -1,0 +1,22 @@
+# Toda segunda-feira, roda a extensão contra os serviços de verdade (Rotten
+# Tomatoes, índice de busca do RT, Wikidata, TMDB) com títulos conhecidos.
+# Se algo mudou e quebrou a busca, a execução falha e o GitHub manda e-mail
+# pra quem é dono do repositório. Dá pra rodar à mão na aba Actions.
+name: Checagem semanal
+
+on:
+  schedule:
+    - cron: "17 12 * * 1" # segunda, 9h17 em Brasília
+  workflow_dispatch:
+
+jobs:
+  saude:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Checa as fontes de nota
+        run: node tests/health.js

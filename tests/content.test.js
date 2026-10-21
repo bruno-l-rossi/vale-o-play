@@ -279,6 +279,15 @@ test("nota de críticos vinda da média das temporadas: asterisco e dica explica
   assert.ok(!one.classList.contains("vop-top"), "uma temporada só não dá troféu");
 });
 
+test("Netflix manda o código do título junto com o nome; Disney+ não", async () => {
+  const nf = await setup("https://www.netflix.com/browse", NETFLIX_2026);
+  const genie = nf.asked.find((m) => m.title === "Genie, Make a Wish");
+  assert.equal(genie.nfId, "81748484");
+  assert.equal(genie.site, "netflix");
+  const dp = await setup("https://www.disneyplus.com/pt-br/home", DISNEY_TILES);
+  assert.ok(dp.asked.every((m) => !m.nfId && m.site === "disney"));
+});
+
 test("site desconhecido: script não faz nada", async () => {
   const { doc, asked } = await setup("https://example.com/", NETFLIX_2026);
   assert.equal(asked.length, 0);

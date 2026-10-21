@@ -1,8 +1,11 @@
-// Vale o Play? — service worker (v3.1)
+// Vale o Play? — service worker (v3.2)
 //
-// Recebe { title, year?, mediaType?, site? } do content script (Netflix ou
-// Disney+) e devolve as notas. Pipeline, do mais confiável pro último recurso:
+// Recebe { title, year?, mediaType?, site?, nfId? } do content script (Netflix
+// ou Disney+) e devolve as notas. Pipeline, do mais confiável pro último recurso:
 //
+//   0. Netflix: o card traz o id do título (/browse?jbv=ID) e o Wikidata liga
+//      esse id direto à página do RT (P1874 -> P1258). Sem TMDB e sem
+//      casamento por nome. Se o Wikidata não conhecer o id, segue pelo nome.
 //   1. TMDB (pt-BR): casa o nome exibido no streaming com a obra certa. Cada
 //      candidato ganha pontos por nome exato, ano e tipo (filme/série), e só
 //      passa de um mínimo de confiança — nada de "pega o 1º resultado".
@@ -26,6 +29,11 @@
 // nome do card): 92,6% com nota do RT (v3.0: 89,5%), 83,4% com as duas notas
 // (v3.0: 71,4%). Os que ficam fora não têm nota nenhuma no RT.
 //
+// Desempenho: pedidos de vários cards que chegam juntos viram uma consulta só
+// ao Wikidata e um POST só ao índice do RT (makeBatcher). Cache com validade
+// pela idade do título (lançamento 2 dias, até 5 anos 7 dias, clássico 30) e
+// "mostra a antiga e atualiza por trás" quando vence.
+//
 // PARTES FRÁGEIS: a chave pública do índice (renovada sozinha lendo a home do
 // RT, ver algoliaCreds) e a leitura do HTML do RT (parseRtScores e
 // parseRtSeasons).
@@ -36,16 +44,16 @@ const MINUTE = 60 * 1000;
 const DAY = 24 * 60 * MINUTE;
 
 // Muda quando a lógica/fonte da nota muda: invalida o cache antigo sozinho.
-const CACHE_VERSION = "v8";
+const CACHE_VERSION = "v9";
 const CACHE_PREFIX = CACHE_VERSION + ":";
 const CLEARED_KEY = "vop:clearedAt"; // avisa as abas quando o cache é limpo
 
-const POSITIVE_TTL = 7 * DAY; // achou nota
 const FALLBACK_TTL = 1 * DAY; // achou só reserva com erro temporário no RT
 const NEGATIVE_TTL = 1 * DAY; // título sem nota em lugar nenhum
 const TRANSIENT_TTL = 15 * MINUTE; // falha de rede/limite: tenta de novo logo
+const STALE_GRACE = 30 * DAY; // nota vencida ainda serve enquanto atualiza
 
-const MAX_CONCURRENT = 4; // títulos resolvidos em paralelo
+const MAX_CONCURRENT = 8; // títulos resolvidos em paralelo pelo nome (TMDB)
 const FETCH_TIMEOUT_MS = 12000;
 const MIN_IMDB_VOTES = 500; // ignora nota IMDb de título obscuro
 const MIN_TMDB_VOTES = 20; // idem pro último recurso
@@ -536,37 +544,123 @@ async function rtLegacyLookup(info, ctx) {
   return null;
 }
 
-// ---- 3a. Wikidata: IMDb id / TMDB id -> endereço exato da página no RT ----
+// ---------------------------------------------------------------------------
+// Lotes: junta pedidos que chegam quase ao mesmo tempo numa requisição só
+// ---------------------------------------------------------------------------
+
+// Uma página da Netflix pede a nota de 20 a 40 cards de uma vez. Em vez de
+// uma consulta por card, os pedidos que chegam numa janela curta viram uma
+// consulta só (Wikidata aceita uma lista de ids; o índice do RT aceita várias
+// buscas num POST). run(keys) devolve um Map chave -> resultado; quem não
+// estiver no Map recebe null; se run falhar, todos recebem undefined (erro).
+// wait curto: os pedidos dos cards visíveis chegam praticamente juntos, e
+// cada milissegundo de espera atrasa o badge.
+function makeBatcher(run, { wait = 15, max = 40 } = {}) {
+  let pending = new Map(); // chave -> [resolve...]
+  let timer = null;
+  const flush = () => {
+    clearTimeout(timer);
+    timer = null;
+    const batch = pending;
+    pending = new Map();
+    if (!batch.size) return;
+    run([...batch.keys()]).then(
+      (out) => batch.forEach((rs, k) => rs.forEach((r) => r(out && out.has(k) ? out.get(k) : out ? null : undefined))),
+      () => batch.forEach((rs) => rs.forEach((r) => r(undefined)))
+    );
+  };
+  return (key) =>
+    new Promise((resolve) => {
+      if (!pending.has(key)) pending.set(key, []);
+      pending.get(key).push(resolve);
+      if (pending.size >= max) flush();
+      else if (!timer) timer = setTimeout(flush, wait);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 3a. Wikidata: id -> endereço exato da página no RT
+// ---------------------------------------------------------------------------
 
 // Propriedades do Wikidata: P345 = IMDb id, P4947 = TMDB filme,
-// P4983 = TMDB série, P1258 = Rotten Tomatoes id ("m/the_godfather").
-async function wikidataRtPath(info, ctx) {
-  const ids = [];
-  if (/^tt\d+$/.test(info.imdbId || "")) ids.push(`{ ?i wdt:P345 "${info.imdbId}" }`);
-  if (Number.isInteger(info.id)) ids.push(`{ ?i wdt:${info.type === "movie" ? "P4947" : "P4983"} "${info.id}" }`);
-  if (!ids.length) return null;
-  const sparql = `SELECT DISTINCT ?rt WHERE { ${ids.join(" UNION ")} ?i wdt:P1258 ?rt }`;
-  const url = `${WIKIDATA_SPARQL}?format=json&query=${encodeURIComponent(sparql)}`;
-  const opts = {
-    soft: true, // fonte complementar: se cair, o índice do RT cobre
-    timeout: WIKIDATA_TIMEOUT_MS,
-    headers: { Accept: "application/sparql-results+json", "Api-User-Agent": "ValeOPlay/3.1 (github.com/bruno-l-rossi/vale-o-play)" },
-  };
+// P4983 = TMDB série, P1874 = Netflix id, P1258 = Rotten Tomatoes id
+// ("m/the_godfather"), P577 = data de lançamento.
+const WD_PROPS = { imdb: "P345", tmdbm: "P4947", tmdbt: "P4983", nf: "P1874" };
+const WIKIDATA_HEADERS = {
+  Accept: "application/sparql-results+json",
+  "Api-User-Agent": "ValeOPlay/3.2 (github.com/bruno-l-rossi/vale-o-play)",
+};
+
+const isRtPath = (p) => /^(m|tv)\/[^/\s]+$/.test(p);
+
+async function sparql(query) {
+  const url = `${WIKIDATA_SPARQL}?format=json&query=${encodeURIComponent(query)}`;
+  const opts = { soft: true, timeout: WIKIDATA_TIMEOUT_MS, headers: WIKIDATA_HEADERS };
+  const ctx = { transient: false };
   let status = 0;
   let j = await getJson(url, ctx, { ...opts, onStatus: (s) => (status = s) });
   if (!j && status === 429) {
     await sleep(1500); // limite de ritmo do Wikidata: uma nova tentativa
     j = await getJson(url, ctx, opts);
   }
-  const prefix = info.type === "movie" ? "m/" : "tv/";
-  // ignora endereço de temporada ("tv/x/s02") e de outro tipo
-  const paths = (j?.results?.bindings || [])
-    .map((b) => String(b.rt?.value || "").trim().toLowerCase())
-    .filter((p) => p.startsWith(prefix) && /^(m|tv)\/[^/\s]+$/.test(p));
-  return paths[0] || null;
+  if (!j) throw new Error("wikidata indisponível");
+  return j?.results?.bindings || [];
 }
 
-// ---- 3b. Índice de busca do RT (Algolia) ----
+// Chaves "imdb:tt0068646", "tmdbm:238", "tmdbt:1399", "nf:80057281".
+// Devolve chave -> { paths: [...], label, year, imdb }.
+async function wikidataLookup(keys) {
+  const values = keys
+    .map((k) => {
+      const [kind, val] = k.split(":");
+      return WD_PROPS[kind] ? `(wdt:${WD_PROPS[kind]} "${val}" "${k}")` : null;
+    })
+    .filter(Boolean);
+  if (!values.length) return new Map();
+  const rows = await sparql(`SELECT ?key ?rt ?label ?imdb (MIN(YEAR(?d)) AS ?year) WHERE {
+  VALUES (?p ?v ?key) { ${values.join(" ")} }
+  ?i ?p ?v .
+  OPTIONAL { ?i wdt:P1258 ?rt }
+  OPTIONAL { ?i wdt:P345 ?imdb }
+  OPTIONAL { ?i rdfs:label ?label FILTER(LANG(?label) = "en") }
+  OPTIONAL { ?i wdt:P577 ?d }
+} GROUP BY ?key ?rt ?label ?imdb`);
+  const out = new Map();
+  for (const b of rows) {
+    const key = b.key?.value;
+    if (!key) continue;
+    const cur = out.get(key) || { paths: [], label: null, year: null, imdb: null };
+    const rt = String(b.rt?.value || "").trim().toLowerCase();
+    if (rt && isRtPath(rt) && !cur.paths.includes(rt)) cur.paths.push(rt);
+    cur.label = cur.label || b.label?.value || null;
+    cur.imdb = cur.imdb || b.imdb?.value || null;
+    const y = toInt(b.year?.value);
+    if (y && (!cur.year || y < cur.year)) cur.year = y;
+    out.set(key, cur);
+  }
+  return out;
+}
+
+const wikidataBatch = makeBatcher(wikidataLookup, { wait: 15, max: 25 });
+
+// IMDb id / TMDB id -> endereços do RT do tipo certo (ignora temporada).
+// Pode vir mais de um: o RT às vezes tem página duplicada da mesma obra
+// ("tv/x_men" com nota e "tv/x_men_1992" vazia), e o Wikidata guarda as duas.
+async function wikidataRtPaths(info) {
+  const keys = [];
+  if (/^tt\d+$/.test(info.imdbId || "")) keys.push(`imdb:${info.imdbId}`);
+  if (Number.isInteger(info.id)) keys.push(`${info.type === "movie" ? "tmdbm" : "tmdbt"}:${info.id}`);
+  if (!keys.length) return [];
+  const prefix = info.type === "movie" ? "m/" : "tv/";
+  const found = await Promise.all(keys.map((k) => wikidataBatch(k)));
+  const out = [];
+  for (const f of found) for (const p of f?.paths || []) if (p.startsWith(prefix) && !out.includes(p)) out.push(p);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// 3b. Índice de busca do RT (Algolia), com lote entre títulos
+// ---------------------------------------------------------------------------
 
 let algoliaMem = null;
 
@@ -594,9 +688,9 @@ async function algoliaCreds(refresh) {
   return algoliaMem;
 }
 
-// Várias buscas numa requisição só. Devolve os resultados sem repetição, ou
-// null se o índice estiver indisponível (aí entra o plano C).
-async function algoliaSearch(queries, ctx) {
+// Executa várias buscas num POST. Devolve a lista de resultados (uma lista
+// de hits por busca), ou null se o índice estiver fora.
+async function algoliaRaw(queries) {
   const run = async (creds) => {
     let status = 0;
     const body = JSON.stringify({
@@ -611,7 +705,7 @@ async function algoliaSearch(queries, ctx) {
         }).toString(),
       })),
     });
-    const j = await getJson(`https://${creds.aId.toLowerCase()}-dsn.algolia.net/1/indexes/*/queries`, ctx, {
+    const j = await getJson(`https://${creds.aId.toLowerCase()}-dsn.algolia.net/1/indexes/*/queries`, { transient: false }, {
       method: "POST",
       body,
       soft: true,
@@ -626,10 +720,29 @@ async function algoliaSearch(queries, ctx) {
     if (fresh) ({ j } = await run(fresh));
   }
   if (!j || !Array.isArray(j.results)) return null;
+  return j.results.map((r) => r.hits || []);
+}
+
+// Lote: cada pedido é uma busca (serializada como chave); vários títulos
+// dividem o mesmo POST.
+const algoliaBatch = makeBatcher(
+  async (keys) => {
+    const lists = await algoliaRaw(keys.map((k) => JSON.parse(k)));
+    if (!lists) throw new Error("índice indisponível");
+    return new Map(keys.map((k, i) => [k, lists[i] || []]));
+  },
+  { wait: 15, max: 48 }
+);
+
+// Várias buscas de um título. Devolve os hits sem repetição, ou null se o
+// índice estiver indisponível (aí entra o plano C).
+async function algoliaSearch(queries) {
+  const lists = await Promise.all(queries.map((q) => algoliaBatch(JSON.stringify(q))));
+  if (lists.some((l) => l === undefined)) return null;
   const seen = new Set();
   const hits = [];
-  for (const r of j.results) {
-    for (const h of r.hits || []) {
+  for (const list of lists) {
+    for (const h of list || []) {
       // filme e série podem ter o mesmo vanity (m/x e tv/x): a chave é o par
       const key = `${h.type}/${h.vanity}`;
       if (!h.vanity || seen.has(key)) continue;
@@ -640,7 +753,7 @@ async function algoliaSearch(queries, ctx) {
   return hits;
 }
 
-const isLatin = (s) => !!s && !/[^\u0000-\u024f\u1e00-\u1eff\u2000-\u206f]/.test(s);
+const isLatin = (s) => !!s && !/[^\u0000-ɏḀ-ỿ -⁯]/.test(s);
 const hitPath = (h) => `${h.type === "movie" ? "m" : "tv"}/${h.vanity}`;
 
 // Monta as buscas: nome em inglês, original (se em alfabeto latino), nomes
@@ -712,59 +825,26 @@ function hitScores(h) {
   };
 }
 
-// Junta Wikidata + índice. Retorna { url, critics, audience, certified, via }
-// (notas podem vir nulas: o título está no RT mas sem avaliação), ou null.
-async function rtFind(info, shownTitle, ctx) {
-  const [wdPath, hits] = await Promise.all([
-    wikidataRtPath(info, ctx),
-    algoliaSearch(algoliaQueries(info, shownTitle), ctx),
-  ]);
+// ---------------------------------------------------------------------------
+// 3c. Notas de um endereço do RT
+// ---------------------------------------------------------------------------
 
-  let path = null;
-  let hit = null;
-  let via = null;
-  if (wdPath) {
-    path = wdPath;
-    via = "wikidata";
-    hit = (hits || []).find((h) => hitPath(h) === wdPath) || null;
-  } else if (hits) {
-    hit = pickAlgolia(hits, info, shownTitle);
-    if (hit) {
-      path = hitPath(hit);
-      via = "rt-index";
-    }
-  }
-
-  if (!path) {
-    if (hits) return null; // o índice respondeu e o título não está no RT
-    const old = await rtLegacyLookup(info, ctx); // índice fora: plano C
-    return old ? { ...old, via: "rt-search" } : null;
-  }
-
+// Com o endereço e (se houver) o resultado do índice: se o índice já trouxe
+// as duas notas, nem abre a página. Senão a página é a palavra final; série
+// sem nota de críticos da série inteira usa a média das temporadas.
+// Devolve { url, critics, audience, certified, criticsSeasons?, html } ou null
+// (html só pra quem precisa saber se a página existe).
+async function rtScoresForPath(path, hit, ctx) {
   const url = `${RT_BASE}/${path}`;
   const fromIndex = hitScores(hit);
-  // índice completo: não precisa abrir a página
-  if (fromIndex.critics !== null && fromIndex.audience !== null) {
-    return { url, ...fromIndex, via };
-  }
-  // faltou alguma nota no índice (ou o Wikidata apontou algo fora dele):
-  // a página é a palavra final
+  if (fromIndex.critics !== null && fromIndex.audience !== null) return { url, ...fromIndex, pageOk: true };
   const html = await getText(url, ctx);
   const page = parseRtScores(html);
-  let out;
-  if (page) {
-    out = { url, critics: page.critics, audience: page.audience, certified: page.certified, via };
-  } else if (!hit && !html && hits) {
-    // endereço do Wikidata desatualizado (página sumiu): decide pelo índice
-    const alt = pickAlgolia(hits, info, shownTitle);
-    out = alt
-      ? { url: `${RT_BASE}/${hitPath(alt)}`, ...hitScores(alt), via: "rt-index" }
-      : { url, ...fromIndex, via };
-  } else {
-    out = { url, ...fromIndex, via };
-  }
-  // série sem nota de críticos da série inteira: média das temporadas
-  if (out.critics === null && path.startsWith("tv/") && out.url === url) {
+  const out = page
+    ? { url, critics: page.critics, audience: page.audience, certified: page.certified }
+    : { url, ...fromIndex };
+  out.pageOk = !!html || !!hit;
+  if (out.critics === null && path.startsWith("tv/")) {
     const s = parseRtSeasons(html, path);
     if (s) {
       out.critics = s.critics;
@@ -775,14 +855,65 @@ async function rtFind(info, shownTitle, ctx) {
   return out;
 }
 
+// Ordena endereços candidatos: primeiro os que o índice conhece com nota.
+function orderPaths(paths, hits) {
+  const rank = (p) => {
+    const h = (hits || []).find((x) => hitPath(x) === p);
+    const sc = hitScores(h);
+    return h ? (sc.critics !== null || sc.audience !== null ? 0 : 1) : 2;
+  };
+  return [...paths].sort((a, b) => rank(a) - rank(b));
+}
+
+// Tenta os endereços em ordem até um ter nota (no máximo 3 páginas).
+// Devolve o primeiro com nota, ou o primeiro que existe (sem nota), ou null.
+async function firstScored(paths, hits, ctx, tried) {
+  let fallback = null;
+  for (const p of orderPaths(paths, hits).slice(0, 3)) {
+    if (tried.has(p)) continue;
+    tried.add(p);
+    const hit = (hits || []).find((h) => hitPath(h) === p) || null;
+    const r = await rtScoresForPath(p, hit, ctx);
+    if (hasScore(r)) return r;
+    if (r.pageOk && !fallback) fallback = r;
+  }
+  return fallback;
+}
+
+// Junta Wikidata + índice. Retorna { url, critics, audience, certified,
+// criticsSeasons?, via } (notas podem vir nulas: está no RT sem avaliação) ou null.
+async function rtFind(info, shownTitle, ctx) {
+  const [wdPaths, hits] = await Promise.all([
+    wikidataRtPaths(info).catch(() => []),
+    algoliaSearch(algoliaQueries(info, shownTitle)),
+  ]);
+  const tried = new Set();
+
+  const fromWd = wdPaths.length ? await firstScored(wdPaths, hits, ctx, tried) : null;
+  if (hasScore(fromWd)) return { ...fromWd, via: "wikidata" };
+
+  if (hits) {
+    // Wikidata sem endereço, endereço desatualizado ou página sem nota:
+    // o índice decide (se achar outra página da mesma obra com nota)
+    const hit = pickAlgolia(hits, info, shownTitle);
+    if (hit && !tried.has(hitPath(hit))) {
+      const r = await rtScoresForPath(hitPath(hit), hit, ctx);
+      if (hasScore(r) || !fromWd) return { ...r, via: "rt-index" };
+    }
+    return fromWd ? { ...fromWd, via: "wikidata" } : null;
+  }
+  if (fromWd) return { ...fromWd, via: "wikidata" };
+  const old = await rtLegacyLookup(info, ctx); // índice fora: plano C
+  return old ? { ...old, via: "rt-search" } : null;
+}
+
 // TMDB não achou a obra: tenta o nome exibido direto no índice do RT, que
 // guarda nomes em português nos apelidos. Só aceita casamento exato e único.
-async function rtByShownTitle(q, ctx) {
+async function rtByShownTitle(q) {
   const types = q.mediaType ? [q.mediaType] : ["movie", "tv"];
-  const hits = await algoliaSearch(
-    [{ query: q.title, filters: types.length === 1 ? `type:${types[0]}` : undefined, hits: 10 }],
-    ctx
-  );
+  const hits = await algoliaSearch([
+    { query: q.title, filters: types.length === 1 ? `type:${types[0]}` : undefined, hits: 10 },
+  ]);
   if (!hits) return null;
   const found = hits.filter(
     (h) =>
@@ -822,46 +953,65 @@ async function omdbLookup(imdbId, ctx) {
 // Pipeline completo
 // ---------------------------------------------------------------------------
 
-function matchLabel(info) {
-  const name = info.enTitle || info.originalTitle;
-  return name ? `${name}${info.year ? ` (${info.year})` : ""}` : null;
+function matchLabel(name, year) {
+  return name ? `${name}${year ? ` (${year})` : ""}` : null;
 }
 
 const hasScore = (r) => !!r && (r.critics !== null || r.audience !== null);
 
-async function fetchScore(q, ctx) {
+function rtResult(rt, match, year) {
+  return {
+    source: "rt",
+    critics: rt.critics,
+    audience: rt.audience,
+    certified: !!rt.certified,
+    ...(rt.criticsSeasons ? { criticsSeasons: rt.criticsSeasons } : {}),
+    rating: null,
+    url: rt.url,
+    match,
+    year: year || null,
+  };
+}
+
+// Caminho rápido da Netflix: o card traz o id do título (/browse?jbv=ID) e o
+// Wikidata liga esse id direto à página do RT (P1874 -> P1258). Sem TMDB, sem
+// casamento por nome, sem homônimo errado. Devolve o resultado, ou null pra
+// seguir pelo caminho por nome.
+async function fetchByNetflixId(q, ctx) {
+  const wd = await wikidataBatch(`nf:${q.nfId}`);
+  if (!wd || !wd.paths.length) return null;
+  let hits = null;
+  if (wd.label) {
+    const types = [...new Set(wd.paths.map((p) => (p.startsWith("m/") ? "movie" : "tv")))];
+    hits = await algoliaSearch([
+      { query: wd.label, filters: types.length === 1 ? `type:${types[0]}` : undefined, hits: 10 },
+    ]);
+  }
+  const rt = await firstScored(wd.paths, hits, ctx, new Set());
+  if (!hasScore(rt)) return null;
+  const hit = (hits || []).find((h) => `${RT_BASE}/${hitPath(h)}` === rt.url);
+  ctx.via = "netflix-id";
+  const year = hit?.releaseYear || wd.year;
+  return rtResult(rt, matchLabel(hit?.title || wd.label, year), year);
+}
+
+// Caminho por nome: TMDB -> Wikidata/índice do RT -> OMDb -> TMDB.
+async function fetchByTitle(q, ctx) {
   const hit = await tmdbMatch(q, ctx);
   if (!hit) {
     // obra fora do TMDB (ou nome que ele não reconhece): tenta direto no RT
-    const direct = await rtByShownTitle(q, ctx);
+    const direct = await rtByShownTitle(q);
     if (!hasScore(direct)) return null;
     const h = direct.hit;
-    return {
-      source: "rt",
-      critics: direct.critics,
-      audience: direct.audience,
-      certified: direct.certified,
-      rating: null,
-      url: direct.url,
-      match: `${h.title}${h.releaseYear ? ` (${h.releaseYear})` : ""}`,
-    };
+    return rtResult(direct, matchLabel(h.title, h.releaseYear), h.releaseYear);
   }
   const info = await tmdbInfo(hit, ctx);
-  const match = matchLabel(info);
+  ctx.info = info;
+  const match = matchLabel(info.enTitle || info.originalTitle, info.year);
 
   const rt = await rtFind(info, q.title, ctx);
-  if (hasScore(rt)) {
-    return {
-      source: "rt",
-      critics: rt.critics,
-      audience: rt.audience,
-      certified: !!rt.certified,
-      ...(rt.criticsSeasons ? { criticsSeasons: rt.criticsSeasons } : {}),
-      rating: null,
-      url: rt.url,
-      match,
-    };
-  }
+  ctx.via = rt?.via || null;
+  if (hasScore(rt)) return rtResult(rt, match, info.year);
 
   const omdb = info.imdbId ? await omdbLookup(info.imdbId, ctx) : null;
   if (omdb && omdb.critics !== null) {
@@ -873,6 +1023,7 @@ async function fetchScore(q, ctx) {
       rating: null,
       url: omdb.tomatoUrl || `${RT_BASE}/search?search=${encodeURIComponent(info.enTitle || q.title)}`,
       match,
+      year: info.year,
     };
   }
   if (omdb && omdb.imdbRating !== null && omdb.imdbVotes >= MIN_IMDB_VOTES) {
@@ -883,6 +1034,7 @@ async function fetchScore(q, ctx) {
       rating: omdb.imdbRating,
       url: `https://www.imdb.com/title/${info.imdbId}/`,
       match,
+      year: info.year,
     };
   }
   if (info.tmdbRating && info.tmdbVotes >= MIN_TMDB_VOTES) {
@@ -893,16 +1045,31 @@ async function fetchScore(q, ctx) {
       rating: info.tmdbRating,
       url: `https://www.themoviedb.org/${info.type}/${info.id}`,
       match,
+      year: info.year,
     };
   }
   return null;
 }
 
+// O caminho da Netflix roda fora da fila (é barato e vai em lote); o caminho
+// por nome, que bate no TMDB, passa pela fila com limite de paralelismo.
+async function fetchScore(q, ctx) {
+  if (q.nfId) {
+    try {
+      const fast = await fetchByNetflixId(q, ctx);
+      if (fast) return fast;
+    } catch (e) {
+      /* segue pelo nome */
+    }
+  }
+  return enqueue(() => fetchByTitle(q, ctx), q.priority);
+}
+
 // ---------------------------------------------------------------------------
-// Fila (com prioridade pro que o usuário abriu), cache e deduplicação
+// Fila, cache e deduplicação
 // ---------------------------------------------------------------------------
 
-const memCache = new Map(); // chave -> { value, expires }
+const memCache = new Map(); // chave -> { value, expires, stale }
 const inFlight = new Map(); // chave -> Promise
 const queue = [];
 let active = 0;
@@ -919,16 +1086,30 @@ function runQueue() {
 }
 
 function enqueue(fn, priority) {
-  return new Promise((resolve) => {
-    const job = () => fn().then(resolve, () => resolve(undefined));
+  return new Promise((resolve, reject) => {
+    const job = () => fn().then(resolve, reject);
     if (priority === "high") queue.unshift(job);
     else queue.push(job);
     runQueue();
   });
 }
 
+// Netflix: a chave é o id do título (o mesmo card em qualquer idioma, sem
+// ambiguidade). Demais: nome + tipo + ano + site.
 function cacheKey(q) {
+  if (q.nfId) return `${CACHE_PREFIX}nf:${q.nfId}`;
   return `${CACHE_PREFIX}${normalize(q.title)}|${q.mediaType || ""}|${q.year || ""}|${q.site || ""}`;
+}
+
+// Validade pela idade do título: nota de lançamento muda rápido, nota de
+// clássico quase nunca.
+function ttlFor(value, transient) {
+  if (!value) return transient ? TRANSIENT_TTL : NEGATIVE_TTL;
+  if (value.source !== "rt") return transient ? FALLBACK_TTL : 3 * DAY;
+  const age = new Date().getFullYear() - (value.year || 0);
+  if (!value.year || age <= 1) return 2 * DAY;
+  if (age <= 5) return 7 * DAY;
+  return 30 * DAY;
 }
 
 async function readStored(key) {
@@ -954,48 +1135,59 @@ async function writeStored(key, entry) {
   }
 }
 
-async function getScore(q) {
-  const key = cacheKey(q);
-  const now = Date.now();
-
-  const mem = memCache.get(key);
-  if (mem && now < mem.expires) return mem.value;
-
+// Busca de verdade, com deduplicação; grava no cache.
+function refresh(q, key) {
   if (inFlight.has(key)) return inFlight.get(key);
-
   const p = (async () => {
-    const stored = await readStored(key);
-    if (stored && Date.now() < stored.expires) {
-      memCache.set(key, stored);
-      return stored.value;
-    }
     const ctx = { transient: false };
-    const value = await enqueue(() => fetchScore(q, ctx), q.priority);
-    if (value === undefined) return null; // exceção inesperada: não cacheia
-    let ttl;
-    if (value) ttl = value.source === "rt" || !ctx.transient ? POSITIVE_TTL : FALLBACK_TTL;
-    else ttl = ctx.transient ? TRANSIENT_TTL : NEGATIVE_TTL;
-    const entry = { value, expires: Date.now() + ttl };
+    let value;
+    try {
+      value = await fetchScore(q, ctx);
+    } catch (e) {
+      return undefined; // exceção inesperada: não cacheia
+    }
+    const now = Date.now();
+    const ttl = ttlFor(value, ctx.transient);
+    const entry = { value, expires: now + ttl, stale: now + ttl + STALE_GRACE };
     memCache.set(key, entry);
     writeStored(key, entry);
     return value;
   })().finally(() => inFlight.delete(key));
-
   inFlight.set(key, p);
   return p;
 }
 
-// Apaga entradas vencidas e de versões antigas do cache.
+// Cache com "mostra a antiga e atualiza por trás": nota vencida (mas não
+// velha demais) volta na hora e a busca nova roda em segundo plano; a
+// próxima visita já vê a atualizada.
+async function getScore(q) {
+  const key = cacheKey(q);
+  const now = Date.now();
+  let entry = memCache.get(key);
+  if (!entry) {
+    entry = await readStored(key);
+    if (entry) memCache.set(key, entry);
+  }
+  if (entry && now < entry.expires) return entry.value;
+  if (entry && entry.value && now < (entry.stale || 0)) {
+    refresh(q, key);
+    return entry.value;
+  }
+  const v = await refresh(q, key);
+  return v === undefined ? null : v;
+}
+
+// Apaga entradas velhas demais e de versões antigas do cache.
 async function pruneCache() {
   try {
     const all = await chrome.storage.local.get(null);
     const now = Date.now();
-    const stale = Object.keys(all).filter(
-      (k) =>
-        k !== CLEARED_KEY &&
-        k !== ALGOLIA_CREDS_KEY &&
-        (!k.startsWith(CACHE_PREFIX) || !(all[k] && all[k].expires > now))
-    );
+    const stale = Object.keys(all).filter((k) => {
+      if (k === CLEARED_KEY || k === ALGOLIA_CREDS_KEY) return false;
+      if (!k.startsWith(CACHE_PREFIX)) return true;
+      const e = all[k];
+      return !(e && Math.max(e.expires || 0, e.stale || 0) > now);
+    });
     if (stale.length) await chrome.storage.local.remove(stale);
   } catch (e) {
     /* nada a fazer */
@@ -1023,6 +1215,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       mediaType: msg.mediaType === "movie" || msg.mediaType === "tv" ? msg.mediaType : null,
       priority: msg.priority === "high" ? "high" : "normal",
       site: msg.site === "netflix" || msg.site === "disney" ? msg.site : null,
+      nfId: msg.site === "netflix" && /^\d{5,10}$/.test(String(msg.nfId || "")) ? String(msg.nfId) : null,
     };
     getScore(q)
       .then((value) => sendResponse({ ok: true, value: value || null }))

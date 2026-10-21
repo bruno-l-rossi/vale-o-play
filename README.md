@@ -23,6 +23,7 @@ Atualizando de uma versão antiga: em `chrome://extensions`, clique no ícone de
 
 ## De onde vem a nota
 
+0. **Netflix, pelo código do título**: todo card da Netflix tem o código do título no link (`/browse?jbv=81040344`). O Wikidata, a base aberta da Wikipédia, liga esse código direto à página do RT (81040344 → `tv/squid_game`). É o caminho mais rápido e mais certeiro: não depende do nome, então não confunde homônimos nem remakes. Na medição, 7 em cada 10 títulos da Netflix foram resolvidos assim; os outros seguem pelo nome, nos passos abaixo.
 1. **TMDB (The Movie Database)** casa o nome que o streaming mostra (em português) com a obra certa. Cada candidato ganha pontos por nome exato (no título em português, no original ou no inglês), ano e tipo quando a página informa, e número de votos. Só passa quem tem confiança alta, então "Marvel" não vira "Ms. Marvel" e um homônimo obscuro não rouba o lugar da série famosa.
 2. **Homônimos** (o filme "Animal Kingdom" e a série "Animal Kingdom", ou "Doctor Who" de 2005 e o de 2024): quando dois candidatos empatam, a extensão pergunta ao TMDB qual deles está de fato no catálogo da Netflix ou da Disney+ no Brasil e fica com esse.
 3. Na mesma ida ao TMDB vêm o nome em inglês, o ano, o IMDb id e os nomes alternativos usados nos EUA e no Reino Unido.
@@ -38,12 +39,22 @@ Atualizando de uma versão antiga: em `chrome://extensions`, clique no ícone de
 
 458 títulos reais dos catálogos da Netflix e da Disney+ no Brasil, pelo nome em português que aparece no card (222 dos mais populares e 236 da parte menos popular do catálogo):
 
-| | v3.0 | v3.1 |
+| | v3.0 | v3.1 | v3.2 |
+|---|---|---|---|
+| Nota do Rotten Tomatoes | 89,5% | 92,6% | **92,6%** |
+| Rotten Tomatoes com críticos e audiência | 71,4% | 83,4% | **83,4%** |
+| Caem no IMDb/TMDB/sem nota | 48 títulos | 34 títulos | **34 títulos** |
+| Obra errada (homônimos) | 7 | 5 | **5** |
+
+A v3.2 chega nas mesmas páginas do RT que a v3.1 (as 424 conferidas uma a uma), só que mais rápido e com menos pedidos. Mesmos 458 títulos, em páginas de 40 cards, sem cache:
+
+| | v3.1 | v3.2 |
 |---|---|---|
-| Nota do Rotten Tomatoes | 89,5% | **92,6%** |
-| Rotten Tomatoes com críticos e audiência | 71,4% | **83,4%** |
-| Caem no IMDb/TMDB/sem nota | 48 títulos | **34 títulos** |
-| Obra errada (homônimos) | 7 | **5** |
+| Pedidos de rede | 2.297 | **1.400** (−39%) |
+| Metade dos cards com nota em até | 5,4 s | **2,2 s** |
+| 9 em cada 10 cards com nota em até | 11,2 s | **7,2 s** |
+
+Os tempos absolutos são de um teste com o navegador em segundo plano, que segura o ritmo; no uso normal ficam menores. O que vale é a comparação. Na segunda visita, com cache, a nota aparece na hora.
 
 Os 34 que ficam fora do RT foram conferidos um a um no próprio RT: ou o título não está lá (vários animes, novelas e realities), ou está sem nenhuma avaliação (lançamentos da semana, desenhos infantis). Os 5 casos de obra errada são remakes com o mesmo nome no mesmo serviço (A Bela e a Fera de 1991 e de 2017, ambos na Disney+): o card não mostra o ano, então não tem como saber qual é. No detalhe do título, onde o ano aparece, a extensão acerta.
 
@@ -56,7 +67,10 @@ Performance:
 - Só pede nota do que está na tela ou perto dela (IntersectionObserver). Rolar a página puxa o resto.
 - Observa o DOM com debounce (250ms, no máximo 1s de espera) e ignora as próprias mudanças. No player (`/watch`, `/play`) a varredura fica parada.
 - Card reciclado pela Netflix (mesmo elemento, outro título) é detectado e o badge é refeito.
-- O service worker (`background.js`) resolve até 4 títulos em paralelo, dá prioridade ao detalhe que você abriu, deduplica pedidos repetidos e guarda cache de 7 dias por título (1 dia quando não acha nota; 15 minutos quando a falha foi de rede, pra tentar de novo logo).
+- Pedidos em lote: os cards que aparecem juntos viram uma consulta só ao Wikidata e um envio só ao índice de busca do RT, em vez de uma consulta por card.
+- O service worker (`background.js`) resolve até 8 títulos em paralelo pelo nome (o caminho pelo código da Netflix nem entra nessa fila), dá prioridade ao detalhe que você abriu e deduplica pedidos repetidos.
+- Cache pela idade do título: lançamento (deste ano ou do anterior) vale 2 dias, porque a nota ainda muda; até 5 anos, 7 dias; mais antigo, 30 dias. Sem nota em lugar nenhum, 1 dia; falha de rede, 15 minutos.
+- Nota vencida aparece na hora e é atualizada em segundo plano: a próxima visita já mostra a nova.
 
 O popup (`popup.html` + `popup.js`) grava as preferências em `chrome.storage.sync`; o content script escuta as mudanças e aplica na hora, sem recarregar a página. O filtro compara o corte com a nota de críticos (ou audiência na falta dela; IMDb e TMDB viram %, tipo 7,4 → 74). Quando a lógica de nota muda entre versões, o `CACHE_VERSION` no `background.js` é incrementado e o cache antigo é apagado sozinho.
 
@@ -73,6 +87,15 @@ Recarregue a página. O console passa a mostrar `[Vale o Play?] N cards detectad
 Pra desligar: `localStorage.removeItem("valeoplay:debug")`.
 
 ## Testes
+
+### Checagem semanal automática
+
+O repositório tem duas rotinas no GitHub Actions (pasta `.github/workflows`):
+
+- **Testes**: roda os testes automáticos a cada envio pro GitHub.
+- **Checagem semanal**: toda segunda de manhã, roda a extensão contra os serviços de verdade (Rotten Tomatoes, índice de busca do RT, Wikidata e TMDB) com 18 títulos conhecidos. Se o RT mudar a página, trocar a chave pública do índice ou o casamento começar a errar, a rotina falha e o GitHub manda um e-mail pra você. Dá pra rodar na hora pela aba **Actions** → **Checagem semanal** → **Run workflow**. Também roda no computador com `node tests/health.js`.
+
+### Testes automáticos
 
 A pasta `tests/` tem testes automáticos dos dois scripts, com o HTML no formato real da Netflix, da Disney+ e do RT (capturado em outubro de 2026). Precisa de Node 18 ou mais novo:
 
@@ -107,6 +130,7 @@ Hoje a distribuição é por este repositório. Pra instalação de 1 clique, se
 
 ## Histórico
 
+- **3.2.0** (out/2026): na Netflix, a nota vem pelo código do título no card (Wikidata), sem depender do nome: zero homônimo errado na Netflix na medição, e 7 em cada 10 títulos da Netflix sem passar pelo TMDB. Consultas em lote (Wikidata e índice do RT). Cache pela idade do título e nota vencida mostrada na hora enquanto atualiza. Página duplicada no RT (ex.: "X-Men" com e sem ano) não esconde mais a nota. Checagem semanal automática no GitHub e testes a cada envio.
 - **3.1.0** (out/2026): mais títulos com nota do RT (de 89,5% pra 92,6%) e muito mais com as duas notas (de 71,4% pra 83,4%), medido em 458 títulos reais. Endereço exato do RT pelo Wikidata; índice de busca do próprio RT com apelidos em português; nomes alternativos dos EUA/RU; nota de críticos de série longa pela média das temporadas (com asterisco); desempate de homônimos pelo catálogo do serviço no Brasil; correção de filme e série com o mesmo endereço curto no RT; OMDb quase não é mais chamado.
 - **3.0.0** (out/2026): a Netflix trocou a estrutura dos cards (agora `<a data-uia="standard-card" href="/browse?jbv=ID">`, sem `.title-card`) e a extensão parou de achar os títulos. Detecção reescrita sem depender de classe CSS; suporte à Disney+; busca no próprio RT (série deixa de depender de adivinhar URL); casamento no TMDB com pontuação e nome em inglês; OMDb só como reserva; carga só do que está na tela; card reciclado; cache que não guarda erro de rede por 1 dia; botão de limpar cache atualiza as abas; liga/desliga por site; testes automáticos.
 - **2.3.0** (jul/2026): popup (tamanho, posição, filtro, limpar cache), troféu de aclamado, badges na busca e no preview, notas na sinopse.

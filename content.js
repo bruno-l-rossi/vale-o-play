@@ -192,6 +192,7 @@
 
         out.push({
           root: modal,
+          id,
           key: `nfd:${id || ""}:${norm(title)}`,
           title,
           year: label?.year || meta.year,
@@ -318,12 +319,13 @@
   let dead = false; // extensão recarregada: este script ficou órfão
 
   function requestScore(q, priority) {
-    const k = `${norm(q.title)}|${q.type || ""}|${q.year || ""}`;
+    const nfId = SITE === NETFLIX && q.id && /^\d{5,10}$/.test(q.id) ? q.id : null;
+    const k = nfId ? `nf:${nfId}` : `${norm(q.title)}|${q.type || ""}|${q.year || ""}`;
     if (memo.has(k)) return memo.get(k);
     const p = new Promise((resolve) => {
       try {
         chrome.runtime.sendMessage(
-          { type: "getScore", title: q.title, year: q.year || null, mediaType: q.type || null, priority, site: SITE.id },
+          { type: "getScore", title: q.title, year: q.year || null, mediaType: q.type || null, priority, site: SITE.id, nfId },
           (res) => {
             const err = chrome.runtime.lastError;
             if (err || !res) {

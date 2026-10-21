@@ -45,7 +45,7 @@ Tudo que o Developer Dashboard pede, pronto pra copiar e colar. Os campos do for
 **Permission justifications**:
 
 - `storage`:
-  > Caches fetched ratings locally for up to 7 days to avoid repeated requests to external services, and stores the user's display preferences (enabled sites, badge size and position, quality filter). No personal data is stored.
+  > Caches fetched ratings locally for up to 30 days to avoid repeated requests to external services, and stores the user's display preferences (enabled sites, badge size and position, quality filter). No personal data is stored.
 - Host permission `https://www.rottentomatoes.com/*`:
   > Searches Rotten Tomatoes by the title's English name and reads the title page to get critic and audience scores for the titles visible on the user's Netflix or Disney+ page. Only title names are sent.
 - Host permission `https://api.themoviedb.org/*`:
@@ -53,11 +53,11 @@ Tudo que o Developer Dashboard pede, pronto pra copiar e colar. Os campos do for
 - Host permission `https://*.algolia.net/*`:
   > Queries Rotten Tomatoes' own public search index (hosted by Algolia, the same search box rottentomatoes.com uses) by the title's English name to find its Rotten Tomatoes page and scores. Only title names are sent.
 - Host permission `https://query.wikidata.org/*`:
-  > Looks up the title's IMDb id in Wikidata (the open database behind Wikipedia) to get the exact address of its Rotten Tomatoes page. Only title IDs are sent.
+  > Looks up the title's Netflix title code or IMDb id in Wikidata (the open database behind Wikipedia) to get the exact address of its Rotten Tomatoes page. Only title IDs are sent.
 - Host permission `https://www.omdbapi.com/*`:
   > Fallback only: given the IMDb id, returns the title's IMDb rating when Rotten Tomatoes has no entry. Only title IDs are sent.
 - Content script on `https://www.netflix.com/*` and `https://www.disneyplus.com/*`:
-  > Reads title names from the cards and title pages and injects the rating badges. Nothing else on the page is read or modified.
+  > Reads title names (and, on Netflix, the public title code in each card link) from the cards and title pages and injects the rating badges. Nothing else on the page is read or modified.
 
 **Are you using remote code?**: No. (Todo o código vem no pacote; as requisições externas só trazem dados JSON e HTML lido como texto, nunca código executado.)
 
@@ -74,7 +74,7 @@ Tudo que o Developer Dashboard pede, pronto pra copiar e colar. Os campos do for
 
 ## Checklist antes de enviar
 
-1. Rodar `git push` com a versão 3.1.0 (o politica-privacidade.md atualizado precisa estar público no GitHub antes da revisão).
+1. Rodar `git push` com a versão 3.2.0 (o politica-privacidade.md atualizado precisa estar público no GitHub antes da revisão).
 2. Subir o `vale-o-play-store.zip` (sem `.git`, sem `store/`, sem `tests/`) na aba Package.
 3. Preencher as 3 abas com os textos acima.
 4. Submit for review. Resposta costuma chegar por e-mail em poucos dias; rejeição vem com motivo e aceita reenvio.
