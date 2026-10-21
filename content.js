@@ -323,7 +323,7 @@
     const p = new Promise((resolve) => {
       try {
         chrome.runtime.sendMessage(
-          { type: "getScore", title: q.title, year: q.year || null, mediaType: q.type || null, priority },
+          { type: "getScore", title: q.title, year: q.year || null, mediaType: q.type || null, priority, site: SITE.id },
           (res) => {
             const err = chrome.runtime.lastError;
             if (err || !res) {
@@ -364,6 +364,8 @@
   function isTopRated(s) {
     if (s.source === "imdb") return s.rating > 9;
     if (s.source !== "rt") return false;
+    // média de temporadas só vale troféu se vier de 2 ou mais temporadas
+    if (s.criticsSeasons && s.criticsSeasons.rated < 2) return false;
     return s.critics > 90 && s.audience > 90;
   }
 
@@ -379,10 +381,19 @@
       });
     } else {
       if (typeof s.critics === "number") {
+        const cs = s.criticsSeasons;
         parts.push({
           icon: s.critics >= 60 ? "🍅" : "🟢",
           text: `${s.critics}%`,
-          tip: s.certified ? "Críticos (Certified Fresh)" : "Críticos (Tomatometer)",
+          // série sem nota da série inteira no RT: média das temporadas
+          mark: cs ? "*" : "",
+          tip: cs
+            ? cs.rated === 1
+              ? `Críticos: só 1 das ${cs.total} temporadas tem nota no RT`
+              : `Críticos: média das ${cs.rated} temporadas com nota no RT (de ${cs.total})`
+            : s.certified
+              ? "Críticos (Certified Fresh)"
+              : "Críticos (Tomatometer)",
         });
       }
       if (typeof s.audience === "number") {
@@ -409,6 +420,12 @@
         const small = document.createElement("small");
         small.textContent = p.label;
         span.appendChild(small);
+      }
+      if (p.mark) {
+        const mark = document.createElement("small");
+        mark.className = "vop-mark";
+        mark.textContent = p.mark;
+        span.appendChild(mark);
       }
       el.appendChild(span);
     }

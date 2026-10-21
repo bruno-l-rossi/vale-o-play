@@ -261,6 +261,24 @@ test("Netflix pública (sem login): \"Go to Nome\" e capa em background-image", 
   assert.equal(badgeText(doc.getElementById("p1")), "🏆 🍅 95% 🍿 94%");
 });
 
+test("nota de críticos vinda da média das temporadas: asterisco e dica explicando", async () => {
+  const scores = {
+    "Os Simpsons": { source: "rt", critics: 85, audience: 76, criticsSeasons: { rated: 21, total: 38 }, url: "https://rt/s" },
+    NCIS: { source: "rt", critics: 95, audience: 95, criticsSeasons: { rated: 1, total: 24 }, url: "https://rt/n" },
+  };
+  const html = `<div class="row">
+    <div class="slider-item"><a id="s1" href="/browse?jbv=1" aria-label="Os Simpsons" data-uia="standard-card"><img alt="" src="a.webp"></a></div>
+    <div class="slider-item"><a id="s2" href="/browse?jbv=2" aria-label="NCIS" data-uia="standard-card"><img alt="" src="b.webp"></a></div>
+  </div>`;
+  const { doc } = await setup("https://www.netflix.com/browse", html, { scores });
+  const crit = doc.querySelector("#s1 .vop-part");
+  assert.equal(crit.textContent, "🍅 85%*");
+  assert.equal(crit.title, "Críticos: média das 21 temporadas com nota no RT (de 38)");
+  const one = doc.querySelector("#s2 .vop-badge");
+  assert.equal(one.querySelector(".vop-part").title, "Críticos: só 1 das 24 temporadas tem nota no RT");
+  assert.ok(!one.classList.contains("vop-top"), "uma temporada só não dá troféu");
+});
+
 test("site desconhecido: script não faz nada", async () => {
   const { doc, asked } = await setup("https://example.com/", NETFLIX_2026);
   assert.equal(asked.length, 0);

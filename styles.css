@@ -97,6 +97,14 @@
   letter-spacing: 0.02em;
 }
 
+/* "*" na nota de críticos que vem da média das temporadas */
+.vop-badge .vop-mark,
+.vop-inline .vop-mark {
+  margin-left: 1px;
+  font-size: 0.8em;
+  opacity: 0.8;
+}
+
 .vop-badge.vop-clickable {
   cursor: pointer;
 }

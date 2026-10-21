@@ -50,6 +50,10 @@ Tudo que o Developer Dashboard pede, pronto pra copiar e colar. Os campos do for
   > Searches Rotten Tomatoes by the title's English name and reads the title page to get critic and audience scores for the titles visible on the user's Netflix or Disney+ page. Only title names are sent.
 - Host permission `https://api.themoviedb.org/*`:
   > Matches localized (Brazilian Portuguese) Netflix and Disney+ titles with the correct work and retrieves its English name, year and IMDb id. Only title names are sent.
+- Host permission `https://*.algolia.net/*`:
+  > Queries Rotten Tomatoes' own public search index (hosted by Algolia, the same search box rottentomatoes.com uses) by the title's English name to find its Rotten Tomatoes page and scores. Only title names are sent.
+- Host permission `https://query.wikidata.org/*`:
+  > Looks up the title's IMDb id in Wikidata (the open database behind Wikipedia) to get the exact address of its Rotten Tomatoes page. Only title IDs are sent.
 - Host permission `https://www.omdbapi.com/*`:
   > Fallback only: given the IMDb id, returns the title's IMDb rating when Rotten Tomatoes has no entry. Only title IDs are sent.
 - Content script on `https://www.netflix.com/*` and `https://www.disneyplus.com/*`:
@@ -70,7 +74,7 @@ Tudo que o Developer Dashboard pede, pronto pra copiar e colar. Os campos do for
 
 ## Checklist antes de enviar
 
-1. Rodar `git push` com a versão 3.0.0 (o politica-privacidade.md atualizado precisa estar público no GitHub antes da revisão).
+1. Rodar `git push` com a versão 3.1.0 (o politica-privacidade.md atualizado precisa estar público no GitHub antes da revisão).
 2. Subir o `vale-o-play-store.zip` (sem `.git`, sem `store/`, sem `tests/`) na aba Package.
 3. Preencher as 3 abas com os textos acima.
 4. Submit for review. Resposta costuma chegar por e-mail em poucos dias; rejeição vem com motivo e aceita reenvio.

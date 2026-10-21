@@ -1,22 +1,34 @@
-// Vale o Play? — service worker (v3)
+// Vale o Play? — service worker (v3.1)
 //
-// Recebe { title, year?, mediaType? } do content script (Netflix ou Disney+)
-// e devolve as notas. Pipeline, do mais confiável pro último recurso:
+// Recebe { title, year?, mediaType?, site? } do content script (Netflix ou
+// Disney+) e devolve as notas. Pipeline, do mais confiável pro último recurso:
 //
 //   1. TMDB (pt-BR): casa o nome exibido no streaming com a obra certa. Cada
 //      candidato ganha pontos por nome exato, ano e tipo (filme/série), e só
 //      passa de um mínimo de confiança — nada de "pega o 1º resultado".
-//      Se o pt-BR não casar, tenta de novo com os nomes em inglês.
-//   2. TMDB (en-US + external_ids): nome em inglês, ano e IMDb id numa chamada.
-//   3. Rotten Tomatoes: busca no próprio RT pelo nome em inglês, escolhe o
-//      resultado do tipo e ano certos e lê a página do título. As duas notas
-//      (críticos e audiência) saem do JSON "media-scorecard-json" da página.
-//   4. Reserva: OMDb (Tomatometer + nota do IMDb). Só é chamado quando o RT
-//      falha, pra poupar a cota diária da chave grátis.
+//      Se o pt-BR não casar, tenta de novo com os nomes em inglês. Homônimos
+//      empatados são desempatados pelo catálogo do serviço no Brasil.
+//   2. TMDB (en-US + external_ids + alternative_titles): nome em inglês, ano,
+//      IMDb id e nomes alternativos dos EUA/Reino Unido numa chamada só.
+//   3. Rotten Tomatoes, em paralelo:
+//      a. Wikidata: pelo IMDb id (ou TMDB id) devolve o endereço EXATO da
+//         página no RT (ex.: Round 6 -> tv/squid_game). Casamento sem chute.
+//      b. Índice de busca do próprio RT (Algolia, a mesma busca do topo do
+//         site): devolve nome, apelidos (inclusive em português), tipo, ano,
+//         endereço e as DUAS notas, sem precisar abrir a página.
+//      A página do título só é lida quando o índice não trouxe alguma nota.
+//      Série longa sem nota de críticos da série: média das temporadas.
+//      Se o índice cair, a busca HTML antiga do RT entra como plano C.
+//   4. Reserva: OMDb (Tomatometer + nota do IMDb), só quando o RT não tem nota.
 //   5. Último recurso: nota de usuários do TMDB.
 //
-// PARTE FRÁGIL: a leitura do RT depende do HTML do site. Se o RT mudar,
-// os lugares pra ajustar são parseRtSearch e parseRtScores.
+// Medição (21/out/2026, 458 títulos dos catálogos Netflix/Disney+ BR pelo
+// nome do card): 92,6% com nota do RT (v3.0: 89,5%), 83,4% com as duas notas
+// (v3.0: 71,4%). Os que ficam fora não têm nota nenhuma no RT.
+//
+// PARTES FRÁGEIS: a chave pública do índice (renovada sozinha lendo a home do
+// RT, ver algoliaCreds) e a leitura do HTML do RT (parseRtScores e
+// parseRtSeasons).
 
 "use strict";
 
@@ -24,7 +36,7 @@ const MINUTE = 60 * 1000;
 const DAY = 24 * 60 * MINUTE;
 
 // Muda quando a lógica/fonte da nota muda: invalida o cache antigo sozinho.
-const CACHE_VERSION = "v6";
+const CACHE_VERSION = "v8";
 const CACHE_PREFIX = CACHE_VERSION + ":";
 const CLEARED_KEY = "vop:clearedAt"; // avisa as abas quando o cache é limpo
 
@@ -47,6 +59,15 @@ const OMDB_KEY = "c02a8f8d";
 
 const TMDB_API = "https://api.themoviedb.org/3/";
 const RT_BASE = "https://www.rottentomatoes.com";
+const WIKIDATA_SPARQL = "https://query.wikidata.org/sparql";
+const WIKIDATA_TIMEOUT_MS = 6000;
+
+// Índice de busca do RT (Algolia). São as credenciais públicas, só de busca,
+// que o próprio site publica na home (RottenTomatoes.thirdParty.algoliaSearch).
+// Se o RT trocar, a extensão relê a home e guarda as novas (algoliaCreds).
+const ALGOLIA_DEFAULT = { aId: "79FRDP12PN", sId: "175588f6e5f8319b27702e4cc4013561" };
+const ALGOLIA_CREDS_KEY = "vop:algolia";
+const ALGOLIA_FIELDS = "title,titles,aka,type,releaseYear,vanity,rottenTomatoes";
 
 // ---------------------------------------------------------------------------
 // Utilidades de texto
@@ -65,11 +86,24 @@ function normalize(s) {
 
 const ARTICLE_RE = /^(the|a|an|o|os|as|el|la|los|las|le|les|il|der|die|das) /;
 
+const NUMBER_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"];
+
+// Chave "frouxa" do nome: sem acento, pontuação, espaço e artigo inicial;
+// "&" vira "and" e número até 12 vira palavra ("Fantastic 4" = "Fantastic Four").
+function looseKey(s) {
+  return normalize((s || "").replace(/&/g, " and "))
+    .replace(ARTICLE_RE, "")
+    .replace(/\b(\d{1,2})\b/g, (m, d) => NUMBER_WORDS[Number(d)] || m)
+    .replace(/ /g, "");
+}
+
 function sameTitle(a, b) {
   const na = normalize(a);
   const nb = normalize(b);
   if (!na || !nb) return false;
-  return na === nb || na.replace(ARTICLE_RE, "") === nb.replace(ARTICLE_RE, "");
+  if (na === nb || na.replace(ARTICLE_RE, "") === nb.replace(ARTICLE_RE, "")) return true;
+  const la = looseKey(a);
+  return la.length >= 2 && la === looseKey(b);
 }
 
 // Similaridade de Dice por bigramas (0 a 1): tolera pontuação e pequenas
@@ -128,30 +162,37 @@ function decodeEntities(s) {
 // Rede: timeout + registro de falha temporária (pra não cachear erro por 1 dia)
 // ---------------------------------------------------------------------------
 
-async function request(url, ctx, kind) {
+// opts: { method, body, headers, timeout, soft, onStatus }
+//  soft: falha desta fonte não marca o título como "erro temporário" (a fonte
+//        é complementar e outra cobre; ex.: Wikidata).
+async function request(url, ctx, kind, opts = {}) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), opts.timeout || FETCH_TIMEOUT_MS);
   try {
     const res = await fetch(url, {
+      method: opts.method || "GET",
+      body: opts.body,
       signal: ctrl.signal,
       credentials: "omit",
-      headers: { Accept: kind === "text" ? "text/html" : "application/json" },
+      headers: { Accept: kind === "text" ? "text/html" : "application/json", ...(opts.headers || {}) },
     });
     if (!res.ok) {
-      if (res.status === 429 || res.status === 403 || res.status >= 500) ctx.transient = true;
+      if (opts.onStatus) opts.onStatus(res.status);
+      if (!opts.soft && (res.status === 429 || res.status === 403 || res.status >= 500)) ctx.transient = true;
       return null;
     }
     return kind === "text" ? await res.text() : await res.json();
   } catch (e) {
-    ctx.transient = true; // offline, timeout, bloqueio
+    if (!opts.soft) ctx.transient = true; // offline, timeout, bloqueio
     return null;
   } finally {
     clearTimeout(timer);
   }
 }
 
-const getJson = (url, ctx) => request(url, ctx, "json");
-const getText = (url, ctx) => request(url, ctx, "text");
+const getJson = (url, ctx, opts) => request(url, ctx, "json", opts);
+const getText = (url, ctx, opts) => request(url, ctx, "text", opts);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------------------------------------------------------------------------
 // 1-2. TMDB: nome exibido -> obra certa -> nome em inglês, ano e IMDb id
@@ -194,26 +235,55 @@ function scoreCandidate(r, q) {
   return s;
 }
 
+// Candidatos acima do mínimo de confiança, do melhor pro pior.
+function rankTmdb(results, q) {
+  return results
+    .filter((r) => r.media_type === "movie" || r.media_type === "tv")
+    .map((r) => ({ r, s: scoreCandidate(r, q) }))
+    .filter((x) => x.s >= MATCH_THRESHOLD)
+    .sort((a, b) => b.s - a.s);
+}
+
 function pickTmdb(results, q) {
-  let best = null;
-  let bestScore = -Infinity;
-  for (const r of results) {
-    if (r.media_type !== "movie" && r.media_type !== "tv") continue;
-    const s = scoreCandidate(r, q);
-    if (s > bestScore) {
-      best = r;
-      bestScore = s;
-    }
-  }
-  return bestScore >= MATCH_THRESHOLD ? best : null;
+  return rankTmdb(results, q)[0]?.r || null;
+}
+
+// Ids de provedor do TMDB (JustWatch) de cada serviço no Brasil.
+const SITE_PROVIDERS = { netflix: [8, 1796], disney: [337] };
+const TIE_MARGIN = 25; // candidatos a menos disso do 1º contam como empate
+
+// Homônimos ("Animal Kingdom" filme x série, "Doctor Who" 2005 x 2024): o
+// card não traz ano nem tipo, então desempata pelo que está de fato no
+// catálogo do serviço no Brasil. Só consulta quando há empate.
+async function disambiguate(ranked, q, ctx) {
+  const best = ranked[0];
+  if (!best) return null;
+  const providers = SITE_PROVIDERS[q.site];
+  const ties = ranked.filter((x) => best.s - x.s <= TIE_MARGIN).slice(0, 3);
+  if (!providers || ties.length < 2) return best.r;
+  const avail = await Promise.all(
+    ties.map(async ({ r }) => {
+      const j = await getJson(
+        `${TMDB_API}${r.media_type}/${r.id}/watch/providers?api_key=${TMDB_KEY}`,
+        ctx,
+        { soft: true }
+      );
+      const br = j?.results?.BR || {};
+      const list = [...(br.flatrate || []), ...(br.ads || []), ...(br.free || [])];
+      return list.some((p) => providers.includes(p.provider_id));
+    })
+  );
+  const onService = ties.filter((_, i) => avail[i]);
+  // nenhum ou todos no catálogo: a consulta não ajuda, fica a pontuação
+  return onService.length ? onService[0].r : best.r;
 }
 
 async function tmdbMatch(q, ctx) {
   const base = { query: q.title, include_adult: "false", page: "1" };
   const pt = await tmdb("search/multi", { ...base, language: "pt-BR" }, ctx);
   const results = pt?.results || [];
-  const hit = pickTmdb(results, q);
-  if (hit && (hit.vote_count || 0) >= 50) return hit;
+  const ranked = rankTmdb(results, q);
+  if (ranked[0] && (ranked[0].r.vote_count || 0) >= 50) return disambiguate(ranked, q, ctx);
 
   // Sem casamento firme: junta os nomes em inglês. Netflix e Disney+ às vezes
   // exibem o nome em inglês de obra que no TMDB tem título em português e
@@ -226,25 +296,34 @@ async function tmdbMatch(q, ctx) {
     if (cur) cur._altNames = [r.title || r.name].filter(Boolean);
     else byId.set(k, r);
   }
-  return pickTmdb([...byId.values()], q);
+  return disambiguate(rankTmdb([...byId.values()], q), q, ctx);
 }
 
 async function tmdbInfo(hit, ctx) {
   const type = hit.media_type === "movie" ? "movie" : "tv";
   const d = await tmdb(
     `${type}/${hit.id}`,
-    { language: "en-US", append_to_response: "external_ids" },
+    { language: "en-US", append_to_response: "external_ids,alternative_titles" },
     ctx
   );
   const year =
     yearOf(d?.release_date || d?.first_air_date) ||
     yearOf(hit.release_date || hit.first_air_date);
+  // nomes alternativos dos países de língua inglesa (o RT é americano):
+  // filme vem em alternative_titles.titles, série em alternative_titles.results
+  const altList = d?.alternative_titles?.titles || d?.alternative_titles?.results || [];
+  const alt = [
+    ...new Set(
+      altList.filter((t) => ["US", "GB", "CA", "AU"].includes(t.iso_3166_1)).map((t) => t.title).filter(Boolean)
+    ),
+  ].slice(0, 4);
   return {
     type,
     id: hit.id,
     enTitle: d?.title || d?.name || null,
     originalTitle: d?.original_title || d?.original_name || hit.original_title || hit.original_name || null,
     originalLanguage: d?.original_language || hit.original_language || null,
+    alt,
     year,
     imdbId: d?.imdb_id || d?.external_ids?.imdb_id || null,
     tmdbRating: Number.isFinite(d?.vote_average) ? d.vote_average : hit.vote_average ?? null,
@@ -389,6 +468,31 @@ function parseRtScores(html) {
   return null;
 }
 
+// Série longa costuma ficar sem nota de críticos da série inteira no RT
+// (Simpsons, NCIS, Family Guy...), mas tem nota por temporada. A página da
+// série lista as temporadas em <tile-season href="/tv/x/s01"> com a nota em
+// slot="critics-score". A média simples das temporadas com nota é o mesmo
+// critério do "Avg. Tomatometer" do RT (conferido em 8 séries: diferença de
+// no máximo 1 ponto, por arredondamento). Partes/especiais ("s37.2") ficam
+// de fora. Retorna { critics, rated, total } ou null.
+function parseRtSeasons(html, path) {
+  if (!html || !path) return null;
+  const seasons = [];
+  for (const m of html.matchAll(/<tile-season\b[^>]*\bhref="\/([^"]+)"[\s\S]*?<\/tile-season>/gi)) {
+    const href = m[1].replace(/\/+$/, "").toLowerCase();
+    if (!href.startsWith(path.toLowerCase() + "/") || !/\/s\d+$/.test(href)) continue;
+    const sc = /slot="critics-score"[^>]*>\s*(\d{1,3})\s*%/i.exec(m[0]);
+    seasons.push(sc ? clampPct(sc[1]) : null);
+  }
+  const rated = seasons.filter((v) => v !== null);
+  if (!rated.length) return null;
+  return {
+    critics: Math.round(rated.reduce((a, v) => a + v, 0) / rated.length),
+    rated: rated.length,
+    total: seasons.length,
+  };
+}
+
 // URLs candidatas pelo nome em inglês: só usadas se a busca do RT falhar.
 function rtSlugCandidates(enTitle, type, year) {
   if (!enTitle) return [];
@@ -406,7 +510,9 @@ function rtSlugCandidates(enTitle, type, year) {
   return out;
 }
 
-async function rtLookup(info, ctx) {
+// Plano C: busca HTML do RT (/search) + URL pelo nome. Só entra quando o
+// índice de busca está fora do ar.
+async function rtLegacyLookup(info, ctx) {
   const queries = [...new Set([info.enTitle, info.originalLanguage === "en" ? info.originalTitle : null].filter(Boolean))];
 
   for (const q of queries) {
@@ -428,6 +534,265 @@ async function rtLookup(info, ctx) {
     if (page && (!info.year || yearClose(page.year, info.year))) return { url, ...page };
   }
   return null;
+}
+
+// ---- 3a. Wikidata: IMDb id / TMDB id -> endereço exato da página no RT ----
+
+// Propriedades do Wikidata: P345 = IMDb id, P4947 = TMDB filme,
+// P4983 = TMDB série, P1258 = Rotten Tomatoes id ("m/the_godfather").
+async function wikidataRtPath(info, ctx) {
+  const ids = [];
+  if (/^tt\d+$/.test(info.imdbId || "")) ids.push(`{ ?i wdt:P345 "${info.imdbId}" }`);
+  if (Number.isInteger(info.id)) ids.push(`{ ?i wdt:${info.type === "movie" ? "P4947" : "P4983"} "${info.id}" }`);
+  if (!ids.length) return null;
+  const sparql = `SELECT DISTINCT ?rt WHERE { ${ids.join(" UNION ")} ?i wdt:P1258 ?rt }`;
+  const url = `${WIKIDATA_SPARQL}?format=json&query=${encodeURIComponent(sparql)}`;
+  const opts = {
+    soft: true, // fonte complementar: se cair, o índice do RT cobre
+    timeout: WIKIDATA_TIMEOUT_MS,
+    headers: { Accept: "application/sparql-results+json", "Api-User-Agent": "ValeOPlay/3.1 (github.com/bruno-l-rossi/vale-o-play)" },
+  };
+  let status = 0;
+  let j = await getJson(url, ctx, { ...opts, onStatus: (s) => (status = s) });
+  if (!j && status === 429) {
+    await sleep(1500); // limite de ritmo do Wikidata: uma nova tentativa
+    j = await getJson(url, ctx, opts);
+  }
+  const prefix = info.type === "movie" ? "m/" : "tv/";
+  // ignora endereço de temporada ("tv/x/s02") e de outro tipo
+  const paths = (j?.results?.bindings || [])
+    .map((b) => String(b.rt?.value || "").trim().toLowerCase())
+    .filter((p) => p.startsWith(prefix) && /^(m|tv)\/[^/\s]+$/.test(p));
+  return paths[0] || null;
+}
+
+// ---- 3b. Índice de busca do RT (Algolia) ----
+
+let algoliaMem = null;
+
+async function algoliaCreds(refresh) {
+  if (!refresh) {
+    if (algoliaMem) return algoliaMem;
+    try {
+      const stored = (await chrome.storage.local.get(ALGOLIA_CREDS_KEY))[ALGOLIA_CREDS_KEY];
+      if (stored?.aId && stored?.sId) return (algoliaMem = stored);
+    } catch (e) {
+      /* usa o padrão */
+    }
+    return (algoliaMem = ALGOLIA_DEFAULT);
+  }
+  // chave recusada: relê as credenciais públicas que a home do RT publica
+  const html = await getText(`${RT_BASE}/`, { transient: false });
+  const m = /"algoliaSearch"\s*:\s*\{\s*"aId"\s*:\s*"([A-Z0-9]+)"\s*,\s*"sId"\s*:\s*"([A-Za-z0-9]+)"/i.exec(html || "");
+  if (!m) return null;
+  algoliaMem = { aId: m[1], sId: m[2] };
+  try {
+    await chrome.storage.local.set({ [ALGOLIA_CREDS_KEY]: algoliaMem });
+  } catch (e) {
+    /* só memória */
+  }
+  return algoliaMem;
+}
+
+// Várias buscas numa requisição só. Devolve os resultados sem repetição, ou
+// null se o índice estiver indisponível (aí entra o plano C).
+async function algoliaSearch(queries, ctx) {
+  const run = async (creds) => {
+    let status = 0;
+    const body = JSON.stringify({
+      requests: queries.map((q) => ({
+        indexName: "content_rt",
+        params: new URLSearchParams({
+          query: q.query,
+          hitsPerPage: String(q.hits || 10),
+          ...(q.filters ? { filters: q.filters } : {}),
+          attributesToRetrieve: ALGOLIA_FIELDS,
+          attributesToHighlight: "",
+        }).toString(),
+      })),
+    });
+    const j = await getJson(`https://${creds.aId.toLowerCase()}-dsn.algolia.net/1/indexes/*/queries`, ctx, {
+      method: "POST",
+      body,
+      soft: true,
+      headers: { "x-algolia-application-id": creds.aId, "x-algolia-api-key": creds.sId, "content-type": "application/json" },
+      onStatus: (s) => (status = s),
+    });
+    return { j, status };
+  };
+  let { j, status } = await run(await algoliaCreds(false));
+  if (!j && (status === 401 || status === 403)) {
+    const fresh = await algoliaCreds(true);
+    if (fresh) ({ j } = await run(fresh));
+  }
+  if (!j || !Array.isArray(j.results)) return null;
+  const seen = new Set();
+  const hits = [];
+  for (const r of j.results) {
+    for (const h of r.hits || []) {
+      // filme e série podem ter o mesmo vanity (m/x e tv/x): a chave é o par
+      const key = `${h.type}/${h.vanity}`;
+      if (!h.vanity || seen.has(key)) continue;
+      seen.add(key);
+      hits.push(h);
+    }
+  }
+  return hits;
+}
+
+const isLatin = (s) => !!s && !/[^\u0000-\u024f\u1e00-\u1eff\u2000-\u206f]/.test(s);
+const hitPath = (h) => `${h.type === "movie" ? "m" : "tv"}/${h.vanity}`;
+
+// Monta as buscas: nome em inglês, original (se em alfabeto latino), nomes
+// alternativos dos EUA/RU e, pra filme, o nome em português (o RT guarda
+// nomes estrangeiros em "aka": "O Poderoso Chefão" está lá).
+function algoliaQueries(info, shownTitle) {
+  const type = info.type === "movie" ? "movie" : "tv";
+  const names = [
+    info.enTitle,
+    isLatin(info.originalTitle) ? info.originalTitle : null,
+    ...(info.alt || []).slice(0, 2),
+    type === "movie" ? shownTitle : null,
+  ].filter(Boolean);
+  const uniq = [];
+  for (const n of names) if (!uniq.some((u) => normalize(u) === normalize(n))) uniq.push(n);
+  const years = info.year ? ` AND releaseYear:${info.year - 1} TO ${info.year + 1}` : "";
+  const qs = uniq.slice(0, 4).map((query) => ({ query, filters: `type:${type}${years}` }));
+  // uma busca sem filtro: pega ano divergente e filme cadastrado como série
+  if (uniq[0]) qs.push({ query: uniq[0], hits: 10 });
+  return qs;
+}
+
+// Escolhe o resultado do índice. Nome principal ou apelido exato, tipo e ano.
+function pickAlgolia(hits, info, shownTitle) {
+  const type = info.type === "movie" ? "movie" : "tv";
+  const names = [info.enTitle, info.originalTitle, ...(info.alt || [])].filter(Boolean);
+  const local = type === "movie" && shownTitle ? [shownTitle] : [];
+  let best = null;
+  let bestScore = 0;
+  for (const h of hits) {
+    const main = [h.title, ...(h.titles || [])].filter(Boolean);
+    const aka = h.aka || [];
+    let s;
+    if (names.some((n) => main.some((x) => sameTitle(n, x)))) s = 100;
+    else if (names.some((n) => aka.some((x) => sameTitle(n, x)))) s = 90;
+    else if (local.some((n) => [...main, ...aka].some((x) => sameTitle(n, x)))) s = 85;
+    // RT com subtítulo ("Arcane" -> "Arcane: League of Legends"): só com o
+    // nome PRINCIPAL e ano exato (apelido curto tipo "Monster" não vale)
+    else if (names.some((n) => prefixTitle(n, h.title))) s = 60;
+    else continue;
+
+    const y = h.releaseYear;
+    if (info.year && y) {
+      const d = Math.abs(y - info.year);
+      if (d > 1 || (s === 60 && d !== 0)) continue; // outra obra (remake, homônimo)
+      s += d === 0 ? 20 : 8;
+    } else if (info.year) {
+      s -= 5;
+    }
+    if (h.type !== type) {
+      // filme cadastrado como série (ou o contrário): só nome exato + mesmo ano
+      if (s < 120) continue;
+      s -= 15;
+    }
+    if (s > bestScore) {
+      best = h;
+      bestScore = s;
+    }
+  }
+  return best;
+}
+
+function hitScores(h) {
+  const rt = h?.rottenTomatoes || {};
+  return {
+    critics: clampPct(rt.criticsScore),
+    audience: clampPct(rt.audienceScore),
+    certified: !!rt.certifiedFresh,
+  };
+}
+
+// Junta Wikidata + índice. Retorna { url, critics, audience, certified, via }
+// (notas podem vir nulas: o título está no RT mas sem avaliação), ou null.
+async function rtFind(info, shownTitle, ctx) {
+  const [wdPath, hits] = await Promise.all([
+    wikidataRtPath(info, ctx),
+    algoliaSearch(algoliaQueries(info, shownTitle), ctx),
+  ]);
+
+  let path = null;
+  let hit = null;
+  let via = null;
+  if (wdPath) {
+    path = wdPath;
+    via = "wikidata";
+    hit = (hits || []).find((h) => hitPath(h) === wdPath) || null;
+  } else if (hits) {
+    hit = pickAlgolia(hits, info, shownTitle);
+    if (hit) {
+      path = hitPath(hit);
+      via = "rt-index";
+    }
+  }
+
+  if (!path) {
+    if (hits) return null; // o índice respondeu e o título não está no RT
+    const old = await rtLegacyLookup(info, ctx); // índice fora: plano C
+    return old ? { ...old, via: "rt-search" } : null;
+  }
+
+  const url = `${RT_BASE}/${path}`;
+  const fromIndex = hitScores(hit);
+  // índice completo: não precisa abrir a página
+  if (fromIndex.critics !== null && fromIndex.audience !== null) {
+    return { url, ...fromIndex, via };
+  }
+  // faltou alguma nota no índice (ou o Wikidata apontou algo fora dele):
+  // a página é a palavra final
+  const html = await getText(url, ctx);
+  const page = parseRtScores(html);
+  let out;
+  if (page) {
+    out = { url, critics: page.critics, audience: page.audience, certified: page.certified, via };
+  } else if (!hit && !html && hits) {
+    // endereço do Wikidata desatualizado (página sumiu): decide pelo índice
+    const alt = pickAlgolia(hits, info, shownTitle);
+    out = alt
+      ? { url: `${RT_BASE}/${hitPath(alt)}`, ...hitScores(alt), via: "rt-index" }
+      : { url, ...fromIndex, via };
+  } else {
+    out = { url, ...fromIndex, via };
+  }
+  // série sem nota de críticos da série inteira: média das temporadas
+  if (out.critics === null && path.startsWith("tv/") && out.url === url) {
+    const s = parseRtSeasons(html, path);
+    if (s) {
+      out.critics = s.critics;
+      out.certified = false;
+      out.criticsSeasons = { rated: s.rated, total: s.total };
+    }
+  }
+  return out;
+}
+
+// TMDB não achou a obra: tenta o nome exibido direto no índice do RT, que
+// guarda nomes em português nos apelidos. Só aceita casamento exato e único.
+async function rtByShownTitle(q, ctx) {
+  const types = q.mediaType ? [q.mediaType] : ["movie", "tv"];
+  const hits = await algoliaSearch(
+    [{ query: q.title, filters: types.length === 1 ? `type:${types[0]}` : undefined, hits: 10 }],
+    ctx
+  );
+  if (!hits) return null;
+  const found = hits.filter(
+    (h) =>
+      types.includes(h.type) &&
+      [h.title, ...(h.titles || []), ...(h.aka || [])].some((x) => sameTitle(q.title, x)) &&
+      (!q.year || !h.releaseYear || yearClose(h.releaseYear, q.year))
+  );
+  if (found.length !== 1) return null; // ambíguo: melhor sem nota que nota errada
+  const h = found[0];
+  return { hit: h, url: `${RT_BASE}/${hitPath(h)}`, ...hitScores(h) };
 }
 
 // ---------------------------------------------------------------------------
@@ -462,19 +827,36 @@ function matchLabel(info) {
   return name ? `${name}${info.year ? ` (${info.year})` : ""}` : null;
 }
 
+const hasScore = (r) => !!r && (r.critics !== null || r.audience !== null);
+
 async function fetchScore(q, ctx) {
   const hit = await tmdbMatch(q, ctx);
-  if (!hit) return null;
+  if (!hit) {
+    // obra fora do TMDB (ou nome que ele não reconhece): tenta direto no RT
+    const direct = await rtByShownTitle(q, ctx);
+    if (!hasScore(direct)) return null;
+    const h = direct.hit;
+    return {
+      source: "rt",
+      critics: direct.critics,
+      audience: direct.audience,
+      certified: direct.certified,
+      rating: null,
+      url: direct.url,
+      match: `${h.title}${h.releaseYear ? ` (${h.releaseYear})` : ""}`,
+    };
+  }
   const info = await tmdbInfo(hit, ctx);
   const match = matchLabel(info);
 
-  const rt = await rtLookup(info, ctx);
-  if (rt && (rt.critics !== null || rt.audience !== null)) {
+  const rt = await rtFind(info, q.title, ctx);
+  if (hasScore(rt)) {
     return {
       source: "rt",
       critics: rt.critics,
       audience: rt.audience,
-      certified: rt.certified,
+      certified: !!rt.certified,
+      ...(rt.criticsSeasons ? { criticsSeasons: rt.criticsSeasons } : {}),
       rating: null,
       url: rt.url,
       match,
@@ -546,7 +928,7 @@ function enqueue(fn, priority) {
 }
 
 function cacheKey(q) {
-  return `${CACHE_PREFIX}${normalize(q.title)}|${q.mediaType || ""}|${q.year || ""}`;
+  return `${CACHE_PREFIX}${normalize(q.title)}|${q.mediaType || ""}|${q.year || ""}|${q.site || ""}`;
 }
 
 async function readStored(key) {
@@ -609,7 +991,10 @@ async function pruneCache() {
     const all = await chrome.storage.local.get(null);
     const now = Date.now();
     const stale = Object.keys(all).filter(
-      (k) => k !== CLEARED_KEY && (!k.startsWith(CACHE_PREFIX) || !(all[k] && all[k].expires > now))
+      (k) =>
+        k !== CLEARED_KEY &&
+        k !== ALGOLIA_CREDS_KEY &&
+        (!k.startsWith(CACHE_PREFIX) || !(all[k] && all[k].expires > now))
     );
     if (stale.length) await chrome.storage.local.remove(stale);
   } catch (e) {
@@ -637,6 +1022,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       year: Number.isInteger(msg.year) ? msg.year : null,
       mediaType: msg.mediaType === "movie" || msg.mediaType === "tv" ? msg.mediaType : null,
       priority: msg.priority === "high" ? "high" : "normal",
+      site: msg.site === "netflix" || msg.site === "disney" ? msg.site : null,
     };
     getScore(q)
       .then((value) => sendResponse({ ok: true, value: value || null }))

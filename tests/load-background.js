@@ -26,12 +26,12 @@ function loadBackground({ routes = {}, onFetch } = {}) {
       onMessage: { addListener(fn) { listeners.push(fn); } },
     },
   };
-  async function fetch(url) {
+  async function fetch(url, init = {}) {
     calls.push(url);
-    if (onFetch) onFetch(url);
+    if (onFetch) onFetch(url, init);
     for (const [pattern, handler] of Object.entries(routes)) {
       if (url.includes(pattern)) {
-        const r = typeof handler === "function" ? handler(url) : handler;
+        const r = typeof handler === "function" ? handler(url, init) : handler;
         if (r instanceof Error) throw r;
         const status = r.status ?? 200;
         return {
