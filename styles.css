@@ -1,9 +1,10 @@
-/* Vale o Play? — badge nos cards, linha de notas no detalhe e filtro de qualidade.
-   Tudo com prefixo .vop- e reset próprio, pra o CSS da Netflix/Disney+ não
-   vazar pro badge (ex.: sublinhado de link, caixa alta, espaçamento). */
+/* Vale o Play? — badge nos cards, linha de notas no detalhe, cartão de origem
+   e filtro de qualidade. Tudo com prefixo .vop- e reset próprio, pra o CSS da
+   Netflix/Disney+ não vazar pro badge (sublinhado de link, caixa alta, etc.). */
 
 .vop-badge,
-.vop-inline {
+.vop-inline,
+.vop-card {
   all: initial;
   box-sizing: border-box;
   font-family: "Netflix Sans", "Avenir Next", "Helvetica Neue", Helvetica, Arial, sans-serif;
@@ -13,17 +14,39 @@
   text-decoration: none;
   text-transform: none;
   letter-spacing: normal;
-  white-space: nowrap;
   user-select: none;
   -webkit-font-smoothing: antialiased;
 }
 
+.vop-badge,
+.vop-inline {
+  white-space: nowrap;
+}
+
 .vop-badge *,
-.vop-inline * {
+.vop-inline *,
+.vop-card * {
+  box-sizing: border-box;
   font: inherit;
   color: inherit;
   text-decoration: none;
   text-transform: none;
+}
+
+/* ---- Ícones SVG ---- */
+
+.vop-icon {
+  display: inline-block;
+  width: 1.15em;
+  height: 1.15em;
+  flex: none;
+  vertical-align: middle;
+}
+
+.vop-part {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
 }
 
 /* ---- Badge na capa ---- */
@@ -44,7 +67,6 @@
   left: 4px;
 }
 
-/* Tamanhos (popup da extensão) */
 .vop-badge.vop-size-small {
   font-size: 9px;
   padding: 1px 4px;
@@ -61,7 +83,6 @@
   border-radius: 6px;
 }
 
-/* Posições (popup da extensão) */
 .vop-badge.vop-pos-top-left {
   top: 4px;
   left: 4px;
@@ -87,29 +108,40 @@
   left: auto;
 }
 
-/* Fontes alternativas (IMDb/TMDB): rótulo pequeno ao lado da nota */
-.vop-badge .vop-alt small,
-.vop-inline .vop-alt small {
-  margin-left: 4px;
-  font-size: 0.72em;
-  font-weight: 400;
-  opacity: 0.75;
-  letter-spacing: 0.02em;
+/* Fontes alternativas (IMDb/TMDB): chip com o nome da fonte */
+.vop-chip {
+  font-variant-numeric: tabular-nums;
+}
+.vop-chip-imdb {
+  color: #f5c518;
+}
+.vop-chip-tmdb {
+  color: #90cea1;
 }
 
 /* "*" na nota de críticos que vem da média das temporadas */
-.vop-badge .vop-mark,
-.vop-inline .vop-mark {
+.vop-mark {
   margin-left: 1px;
   font-size: 0.8em;
   opacity: 0.8;
 }
 
-.vop-badge.vop-clickable {
+/* Reserva provisória: levemente translúcido até o RT confirmar */
+.vop-provisional {
+  opacity: 0.8;
+}
+
+.vop-badge.vop-clickable,
+.vop-inline.vop-clickable {
   cursor: pointer;
 }
 .vop-badge.vop-clickable:hover {
   background: rgba(0, 0, 0, 0.95);
+}
+.vop-badge:focus-visible,
+.vop-inline:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
 }
 
 /* Aclamados: RT com críticos e audiência acima de 90%, ou IMDb acima de 9,0 */
@@ -129,7 +161,45 @@
   padding: 3px 8px;
 }
 
-/* ---- Linha de notas no detalhe do título ---- */
+/* ---- Estados sem nota ---- */
+
+.vop-badge.vop-state {
+  min-width: 22px;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  color: #ddd;
+}
+.vop-badge.vop-failed {
+  cursor: pointer;
+}
+.vop-badge.vop-failed:hover {
+  background: rgba(0, 0, 0, 0.85);
+}
+.vop-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #bbb;
+  animation: vop-pulse 1s ease-in-out infinite;
+}
+@keyframes vop-pulse {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vop-dot {
+    animation: none;
+    opacity: 0.7;
+  }
+}
+
+/* ---- Linha de notas no detalhe do título / billboard ---- */
 
 .vop-inline {
   display: flex;
@@ -146,15 +216,89 @@
   margin: 4px 0 6px;
   font-size: 13px;
 }
-.vop-inline.vop-clickable {
-  cursor: pointer;
-}
 .vop-inline.vop-clickable:hover .vop-part:not(.vop-trophy) {
   text-decoration: underline;
 }
+.vop-inline.vop-top-inline {
+  text-shadow: 0 0 8px rgba(212, 160, 23, 0.5);
+}
 
-/* ---- Filtro de qualidade: capa esmaecida abaixo do corte ----
-   Hover devolve as cores pra não travar a navegação. */
+/* ---- Cartão de origem da nota (hover/foco no badge) ---- */
+
+.vop-card {
+  position: fixed;
+  z-index: 2147483000;
+  display: block;
+  width: 270px;
+  max-width: calc(100vw - 16px);
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(18, 18, 18, 0.97);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.12);
+  font-size: 12px;
+  font-weight: 400;
+  white-space: normal;
+  user-select: text;
+}
+.vop-card-head {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+  font-weight: 700;
+}
+.vop-card-head span {
+  font-weight: 400;
+  color: #bbb;
+}
+.vop-card-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 3px 0;
+}
+.vop-card-note {
+  display: block;
+  margin: 6px 0 2px;
+  color: #c9c9c9;
+  line-height: 1.35;
+}
+.vop-card-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+.vop-card-btn {
+  all: initial;
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  padding: 5px 8px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.vop-card-btn:hover,
+.vop-card-btn:focus-visible {
+  background: rgba(255, 255, 255, 0.22);
+  outline: none;
+}
+.vop-card-btn.vop-primary {
+  background: #e50914;
+}
+.vop-card-btn.vop-primary:hover,
+.vop-card-btn.vop-primary:focus-visible {
+  background: #f6121d;
+}
+
+/* ---- Filtro de qualidade ----
+   Esmaecer: capa cinza e escura; hover devolve as cores pra não travar a
+   navegação. Esconder: some com o card (a linha da Netflix fecha o vão). */
 .vop-dim img,
 .vop-dim video,
 .vop-dim picture {
@@ -165,4 +309,7 @@
 .vop-dim:hover video,
 .vop-dim:hover picture {
   filter: none;
+}
+.vop-hide {
+  display: none !important;
 }

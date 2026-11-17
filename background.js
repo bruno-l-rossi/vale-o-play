@@ -1,38 +1,34 @@
-// Vale o Play? — service worker (v3.2)
+// Vale o Play? — service worker (v4.0)
 //
-// Recebe { title, year?, mediaType?, site?, nfId? } do content script (Netflix
-// ou Disney+) e devolve as notas. Pipeline, do mais confiável pro último recurso:
+// Recebe { title, year?, mediaType?, site?, nfId?, dpId? } do content script
+// (Netflix ou Disney+) e devolve as notas. Pipeline, do mais confiável pro
+// último recurso:
 //
-//   0. Netflix: o card traz o id do título (/browse?jbv=ID) e o Wikidata liga
-//      esse id direto à página do RT (P1874 -> P1258). Sem TMDB e sem
-//      casamento por nome. Se o Wikidata não conhecer o id, segue pelo nome.
-//   1. TMDB (pt-BR): casa o nome exibido no streaming com a obra certa. Cada
-//      candidato ganha pontos por nome exato, ano e tipo (filme/série), e só
-//      passa de um mínimo de confiança — nada de "pega o 1º resultado".
-//      Se o pt-BR não casar, tenta de novo com os nomes em inglês. Homônimos
-//      empatados são desempatados pelo catálogo do serviço no Brasil.
-//   2. TMDB (en-US + external_ids + alternative_titles): nome em inglês, ano,
-//      IMDb id e nomes alternativos dos EUA/Reino Unido numa chamada só.
-//   3. Rotten Tomatoes, em paralelo:
-//      a. Wikidata: pelo IMDb id (ou TMDB id) devolve o endereço EXATO da
-//         página no RT (ex.: Round 6 -> tv/squid_game). Casamento sem chute.
-//      b. Índice de busca do próprio RT (Algolia, a mesma busca do topo do
-//         site): devolve nome, apelidos (inclusive em português), tipo, ano,
-//         endereço e as DUAS notas, sem precisar abrir a página.
-//      A página do título só é lida quando o índice não trouxe alguma nota.
-//      Série longa sem nota de críticos da série: média das temporadas.
-//      Se o índice cair, a busca HTML antiga do RT entra como plano C.
-//   4. Reserva: OMDb (Tomatometer + nota do IMDb), só quando o RT não tem nota.
+//   M. Mapa gravado: título já resolvido antes -> endereço do RT guardado por
+//      90 dias; só renova a nota (índice do RT ou página). Cache de nota
+//      compartilhado entre Netflix e Disney+ (score:<endereço>).
+//   O. Correção manual (overrides.json no pacote + correções do popup/cartão).
+//   0. Netflix: id do card (/browse?jbv=ID) -> Wikidata P1874 -> P1258.
+//      Disney+: entity-UUID -> Wikidata P13902 (ids antigos: P7595/P7596).
+//      Mapas estáticos opcionais em data/ (scripts/gerar-mapas.js) tiram o
+//      Wikidata do caminho quente.
+//   1. TMDB (pt-BR): casa o nome exibido com a obra certa (pontuação, limiar,
+//      tipo vindo da página pública da Netflix, variantes do nome, desempate
+//      pelo catálogo do serviço no Brasil).
+//   2. TMDB (en-US): nome em inglês, ano, IMDb id, nomes alternativos.
+//   3. Rotten Tomatoes: Wikidata (por IMDb/TMDB id, aceita tipo diferente
+//      quando o vínculo é por IMDb) + índice de busca do RT (Algolia) + página.
+//      Série longa sem nota de críticos: média das temporadas. Se nada
+//      achou: busca HTML do próprio RT.
+//   4. Reserva (provisória se o RT falhou): OMDb (Tomatometer ou IMDb).
 //   5. Último recurso: nota de usuários do TMDB.
 //
-// Medição (21/out/2026, 458 títulos dos catálogos Netflix/Disney+ BR pelo
-// nome do card): 92,6% com nota do RT (v3.0: 89,5%), 83,4% com as duas notas
-// (v3.0: 71,4%). Os que ficam fora não têm nota nenhuma no RT.
+// Resiliência: limite de pedidos por host, disjuntor do RT (3x 403/429 pausam
+// 2 min), reserva provisória (10 min) em vez de 1 dia quando o RT falhou,
+// aviso às abas quando uma nota muda (vop:updatedAt).
 //
-// Desempenho: pedidos de vários cards que chegam juntos viram uma consulta só
-// ao Wikidata e um POST só ao índice do RT (makeBatcher). Cache com validade
-// pela idade do título (lançamento 2 dias, até 5 anos 7 dias, clássico 30) e
-// "mostra a antiga e atualiza por trás" quando vence.
+// Diagnóstico: cada resultado guarda `via` (de onde veio) e `miss` (por que
+// não veio do RT). O popup mostra os contadores e exporta os títulos sem RT.
 //
 // PARTES FRÁGEIS: a chave pública do índice (renovada sozinha lendo a home do
 // RT, ver algoliaCreds) e a leitura do HTML do RT (parseRtScores e
@@ -44,11 +40,18 @@ const MINUTE = 60 * 1000;
 const DAY = 24 * 60 * MINUTE;
 
 // Muda quando a lógica/fonte da nota muda: invalida o cache antigo sozinho.
-const CACHE_VERSION = "v9";
+const CACHE_VERSION = "v10";
 const CACHE_PREFIX = CACHE_VERSION + ":";
 const CLEARED_KEY = "vop:clearedAt"; // avisa as abas quando o cache é limpo
 
-const FALLBACK_TTL = 1 * DAY; // achou só reserva com erro temporário no RT
+const PROVISIONAL_TTL = 10 * MINUTE; // reserva (IMDb/TMDB) enquanto o RT falhou
+const MAP_TTL = 90 * DAY; // endereço do RT de um título já resolvido
+const RT_BREAKER_MS = 2 * MINUTE; // pausa nas leituras do RT após 3x 403/429
+const HOST_LIMITS = { "www.rottentomatoes.com": 4, "api.themoviedb.org": 6 };
+const OVERRIDES_FILE = "overrides.json";
+const NF_MAP_FILE = "data/nf-map.json";
+const DP_MAP_FILE = "data/dp-map.json";
+const PROTECTED_PREFIX = "vop:"; // chaves que a limpeza de cache não apaga
 const NEGATIVE_TTL = 1 * DAY; // título sem nota em lugar nenhum
 const TRANSIENT_TTL = 15 * MINUTE; // falha de rede/limite: tenta de novo logo
 const STALE_GRACE = 30 * DAY; // nota vencida ainda serve enquanto atualiza
@@ -173,7 +176,50 @@ function decodeEntities(s) {
 // opts: { method, body, headers, timeout, soft, onStatus }
 //  soft: falha desta fonte não marca o título como "erro temporário" (a fonte
 //        é complementar e outra cobre; ex.: Wikidata).
+const hostLimiters = {};
+const rtBreaker = { fails: 0, openUntil: 0 };
+const RT_HOST = "www.rottentomatoes.com";
+
+function makeLimiter(max) {
+  let active = 0;
+  const waiting = [];
+  const next = () => {
+    while (active < max && waiting.length) {
+      const job = waiting.shift();
+      active++;
+      job().finally(() => {
+        active--;
+        next();
+      });
+    }
+  };
+  return (fn) =>
+    new Promise((resolve, reject) => {
+      waiting.push(() => fn().then(resolve, reject));
+      next();
+    });
+}
+
+function hostOf(url) {
+  const m = /^https?:\/\/([^/]+)/i.exec(url || "");
+  return m ? m[1].toLowerCase() : "";
+}
+
 async function request(url, ctx, kind, opts = {}) {
+  const host = hostOf(url);
+  const isRt = host === RT_HOST;
+  if (isRt && Date.now() < rtBreaker.openUntil) {
+    if (!opts.soft) ctx.transient = true; // disjuntor aberto: nem tenta
+    return null;
+  }
+  const max = HOST_LIMITS[host];
+  const go = () => rawRequest(url, ctx, kind, opts, isRt);
+  if (!max) return go();
+  const lim = hostLimiters[host] || (hostLimiters[host] = makeLimiter(max));
+  return lim(go);
+}
+
+async function rawRequest(url, ctx, kind, opts, isRt) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), opts.timeout || FETCH_TIMEOUT_MS);
   try {
@@ -184,6 +230,16 @@ async function request(url, ctx, kind, opts = {}) {
       credentials: "omit",
       headers: { Accept: kind === "text" ? "text/html" : "application/json", ...(opts.headers || {}) },
     });
+    if (isRt) {
+      if (res.status === 403 || res.status === 429) {
+        if (++rtBreaker.fails >= 3) {
+          rtBreaker.openUntil = Date.now() + RT_BREAKER_MS;
+          rtBreaker.fails = 0;
+        }
+      } else {
+        rtBreaker.fails = 0;
+      }
+    }
     if (!res.ok) {
       if (opts.onStatus) opts.onStatus(res.status);
       if (!opts.soft && (res.status === 429 || res.status === 403 || res.status >= 500)) ctx.transient = true;
@@ -222,6 +278,7 @@ function scoreCandidate(r, q) {
   } else {
     // nome parecido só vale se for MUITO parecido (pontuação, um "s" a mais);
     // "Marvel" x "Ms. Marvel" (0,83) fica de fora
+    if (q.exact) return -Infinity; // variante do nome: só nome idêntico vale
     const sim = Math.max(...names.map((n) => dice(n, q.title)));
     if (sim < 0.88) return -Infinity;
     s = 60 + (sim - 0.88) * 250; // 0,88 -> 60 ... 1,0 -> 90
@@ -232,7 +289,11 @@ function scoreCandidate(r, q) {
     const d = Math.abs(y - q.year);
     s += d === 0 ? 25 : d === 1 ? 12 : -30;
   }
-  if (q.mediaType) s += r.media_type === q.mediaType ? 10 : -30;
+  if (q.mediaType) {
+    if (r.media_type === q.mediaType) s += 10;
+    else if (q.typeHard) return -Infinity; // tipo confirmado pela página da Netflix
+    else s -= 30;
+  }
 
   // desempate: o que tem mais votos e está em alta (catálogo de streaming);
   // cadastro quase sem voto costuma ser homônimo obscuro
@@ -244,11 +305,11 @@ function scoreCandidate(r, q) {
 }
 
 // Candidatos acima do mínimo de confiança, do melhor pro pior.
-function rankTmdb(results, q) {
+function rankTmdb(results, q, threshold = MATCH_THRESHOLD) {
   return results
     .filter((r) => r.media_type === "movie" || r.media_type === "tv")
     .map((r) => ({ r, s: scoreCandidate(r, q) }))
-    .filter((x) => x.s >= MATCH_THRESHOLD)
+    .filter((x) => x.s >= threshold)
     .sort((a, b) => b.s - a.s);
 }
 
@@ -263,30 +324,30 @@ const TIE_MARGIN = 25; // candidatos a menos disso do 1º contam como empate
 // Homônimos ("Animal Kingdom" filme x série, "Doctor Who" 2005 x 2024): o
 // card não traz ano nem tipo, então desempata pelo que está de fato no
 // catálogo do serviço no Brasil. Só consulta quando há empate.
+
+// A obra está no catálogo do serviço no Brasil? (TMDB / JustWatch)
+async function onService(r, q, ctx) {
+  const providers = SITE_PROVIDERS[q.site];
+  if (!providers) return false;
+  const j = await getJson(`${TMDB_API}${r.media_type}/${r.id}/watch/providers?api_key=${TMDB_KEY}`, ctx, { soft: true });
+  const br = j?.results?.BR || {};
+  const list = [...(br.flatrate || []), ...(br.ads || []), ...(br.free || [])];
+  return list.some((p) => providers.includes(p.provider_id));
+}
+
 async function disambiguate(ranked, q, ctx) {
   const best = ranked[0];
   if (!best) return null;
   const providers = SITE_PROVIDERS[q.site];
   const ties = ranked.filter((x) => best.s - x.s <= TIE_MARGIN).slice(0, 3);
   if (!providers || ties.length < 2) return best.r;
-  const avail = await Promise.all(
-    ties.map(async ({ r }) => {
-      const j = await getJson(
-        `${TMDB_API}${r.media_type}/${r.id}/watch/providers?api_key=${TMDB_KEY}`,
-        ctx,
-        { soft: true }
-      );
-      const br = j?.results?.BR || {};
-      const list = [...(br.flatrate || []), ...(br.ads || []), ...(br.free || [])];
-      return list.some((p) => providers.includes(p.provider_id));
-    })
-  );
-  const onService = ties.filter((_, i) => avail[i]);
+  const avail = await Promise.all(ties.map(({ r }) => onService(r, q, ctx)));
+  const inCatalog = ties.filter((_, i) => avail[i]);
   // nenhum ou todos no catálogo: a consulta não ajuda, fica a pontuação
-  return onService.length ? onService[0].r : best.r;
+  return inCatalog.length ? inCatalog[0].r : best.r;
 }
 
-async function tmdbMatch(q, ctx) {
+async function tmdbMatchOnce(q, ctx) {
   const base = { query: q.title, include_adult: "false", page: "1" };
   const pt = await tmdb("search/multi", { ...base, language: "pt-BR" }, ctx);
   const results = pt?.results || [];
@@ -305,6 +366,61 @@ async function tmdbMatch(q, ctx) {
     else byId.set(k, r);
   }
   return disambiguate(rankTmdb([...byId.values()], q), q, ctx);
+}
+
+// Tipo confirmado pela página da Netflix: tenta só esse tipo; se não achar,
+// relaxa.
+async function tmdbMatch(q, ctx) {
+  const hit = await tmdbMatchOnce(q, ctx);
+  if (hit || !q.typeHard) return hit;
+  return tmdbMatchOnce({ ...q, typeHard: false }, ctx);
+}
+
+// Variantes do nome exibido: o card às vezes traz "(Dublado)", "Temporada 2",
+// "Marvel Studios' X", "O Filme"... Variantes seguras (limpeza) valem com nome
+// idêntico no TMDB; a parte antes dos ":" só vale se a obra estiver mesmo no
+// catálogo do serviço (evita "Homem-Aranha: X" virar outro filme).
+function nameVariants(title) {
+  const out = [];
+  const seen = new Set([normalize(title)]);
+  const add = (text, safe) => {
+    const t = (text || "").replace(/\s+/g, " ").replace(/^[\s:–—-]+|[\s:–—-]+$/g, "");
+    const n = normalize(t);
+    if (t.length < 2 || !n || seen.has(n)) return;
+    seen.add(n);
+    out.push({ t, safe });
+  };
+  let t = String(title || "");
+  t = t.replace(/\s*\([^)]*\)\s*$/, "");
+  add(t, true);
+  t = t.replace(/\s*[:\-–—]?\s*(temporada|season|parte|part|volume|vol\.?)\s*\d+.*$/i, "");
+  add(t, true);
+  t = t
+    .replace(/\s*[:\-–—]\s*(o filme|a s[eé]rie|the movie|the series|edi[cç][aã]o [^:]*|vers[aã]o [^:]*|director'?s cut|extended [^:]*)$/i, "")
+    .replace(/\s+(o filme|a s[eé]rie)$/i, "");
+  add(t, true);
+  t = t.replace(
+    /^(marvel studios'?\s+|marvel'?s\s+|disney'?s\s+|pixar'?s\s+|disney\s*(?:[\/&]|e)\s*pixar\s+|disney[\s-]?pixar\s+|walt disney'?s\s+|star wars\s*[:\-–—]\s*)/i,
+    ""
+  );
+  add(t, true);
+  const head = t.split(/\s*:\s*|\s+[-–—]\s+/)[0];
+  if (head && head !== t) add(head, false);
+  return out.slice(0, 5);
+}
+
+async function tmdbMatchVariants(q, ctx) {
+  for (const v of nameVariants(q.title).slice(0, 3)) {
+    const vq = { ...q, title: v.t, exact: true };
+    const res = await tmdb("search/multi", { query: v.t, include_adult: "false", page: "1", language: "pt-BR" }, ctx);
+    const ranked = rankTmdb(res?.results || [], vq, MATCH_THRESHOLD + 10).filter((x) => (x.r.vote_count || 0) >= 20);
+    if (!ranked.length) continue;
+    const best = ranked[0].r;
+    if (!v.safe && !(await onService(best, q, ctx))) continue;
+    ctx.variant = v.t;
+    return disambiguate(ranked, vq, ctx);
+  }
+  return null;
 }
 
 async function tmdbInfo(hit, ctx) {
@@ -520,7 +636,7 @@ function rtSlugCandidates(enTitle, type, year) {
 
 // Plano C: busca HTML do RT (/search) + URL pelo nome. Só entra quando o
 // índice de busca está fora do ar.
-async function rtLegacyLookup(info, ctx) {
+async function rtLegacyLookup(info, ctx, opts = {}) {
   const queries = [...new Set([info.enTitle, info.originalLanguage === "en" ? info.originalTitle : null].filter(Boolean))];
 
   for (const q of queries) {
@@ -535,6 +651,7 @@ async function rtLegacyLookup(info, ctx) {
     return null;
   }
 
+  if (opts.guess === false) return null;
   // a busca não achou: tenta a URL pelo nome (o RT redireciona apelidos, ex.:
   // /tv/arcane -> /tv/arcane_league_of_legends), mas só aceita se o ano bater
   for (const url of rtSlugCandidates(info.enTitle, info.type, info.year)) {
@@ -585,7 +702,12 @@ function makeBatcher(run, { wait = 15, max = 40 } = {}) {
 // Propriedades do Wikidata: P345 = IMDb id, P4947 = TMDB filme,
 // P4983 = TMDB série, P1874 = Netflix id, P1258 = Rotten Tomatoes id
 // ("m/the_godfather"), P577 = data de lançamento.
-const WD_PROPS = { imdb: "P345", tmdbm: "P4947", tmdbt: "P4983", nf: "P1874" };
+// P13902 = Disney+ browse ID ("entity-<uuid>", o mesmo do /browse/entity-...);
+// P7595/P7596 = Disney+ movie/series ID (formato antigo, 12 caracteres).
+const WD_PROPS = { imdb: "P345", tmdbm: "P4947", tmdbt: "P4983", nf: "P1874", dpe: "P13902", dpm: "P7595", dps: "P7596" };
+let wdTransientAt = 0; // última falha temporária do Wikidata (rede, 429, 5xx)
+let idxTransientAt = 0; // idem pro índice do RT
+const recently = (t) => Date.now() - t < 20000;
 const WIKIDATA_HEADERS = {
   Accept: "application/sparql-results+json",
   "Api-User-Agent": "ValeOPlay/3.2 (github.com/bruno-l-rossi/vale-o-play)",
@@ -603,7 +725,10 @@ async function sparql(query) {
     await sleep(1500); // limite de ritmo do Wikidata: uma nova tentativa
     j = await getJson(url, ctx, opts);
   }
-  if (!j) throw new Error("wikidata indisponível");
+  if (!j) {
+    if (status === 0 || status === 429 || status >= 500) wdTransientAt = Date.now();
+    throw new Error("wikidata indisponível");
+  }
   return j?.results?.bindings || [];
 }
 
@@ -613,7 +738,8 @@ async function wikidataLookup(keys) {
   const values = keys
     .map((k) => {
       const [kind, val] = k.split(":");
-      return WD_PROPS[kind] ? `(wdt:${WD_PROPS[kind]} "${val}" "${k}")` : null;
+      const raw = kind === "dpe" ? `entity-${val}` : val;
+      return WD_PROPS[kind] && /^[\w-]+$/.test(val) ? `(wdt:${WD_PROPS[kind]} "${raw}" "${k}")` : null;
     })
     .filter(Boolean);
   if (!values.length) return new Map();
@@ -646,16 +772,29 @@ const wikidataBatch = makeBatcher(wikidataLookup, { wait: 15, max: 25 });
 // IMDb id / TMDB id -> endereços do RT do tipo certo (ignora temporada).
 // Pode vir mais de um: o RT às vezes tem página duplicada da mesma obra
 // ("tv/x_men" com nota e "tv/x_men_1992" vazia), e o Wikidata guarda as duas.
-async function wikidataRtPaths(info) {
+async function wikidataRtPaths(info, ctx = {}) {
   const keys = [];
   if (/^tt\d+$/.test(info.imdbId || "")) keys.push(`imdb:${info.imdbId}`);
   if (Number.isInteger(info.id)) keys.push(`${info.type === "movie" ? "tmdbm" : "tmdbt"}:${info.id}`);
   if (!keys.length) return [];
   const prefix = info.type === "movie" ? "m/" : "tv/";
   const found = await Promise.all(keys.map((k) => wikidataBatch(k)));
-  const out = [];
-  for (const f of found) for (const p of f?.paths || []) if (p.startsWith(prefix) && !out.includes(p)) out.push(p);
-  return out;
+  if (found.some((f) => f === undefined) && recently(wdTransientAt)) ctx.wdTransient = true;
+  // mesmo tipo primeiro. Endereço de outro tipo (minissérie que o RT guarda
+  // como filme, stand-up, documentário) só vale quando o vínculo é pelo IMDb
+  // id, que identifica a obra sem ambiguidade.
+  const same = [];
+  const other = [];
+  found.forEach((f, i) => {
+    for (const p of f?.paths || []) {
+      if (p.startsWith(prefix)) {
+        if (!same.includes(p)) same.push(p);
+      } else if (keys[i].startsWith("imdb:") && !other.includes(p)) {
+        other.push(p);
+      }
+    }
+  });
+  return [...same, ...other.filter((p) => !same.includes(p))];
 }
 
 // ---------------------------------------------------------------------------
@@ -717,8 +856,9 @@ async function algoliaRaw(queries) {
   let { j, status } = await run(await algoliaCreds(false));
   if (!j && (status === 401 || status === 403)) {
     const fresh = await algoliaCreds(true);
-    if (fresh) ({ j } = await run(fresh));
+    if (fresh) ({ j, status } = await run(fresh));
   }
+  if (!j && (status === 0 || status === 429 || status >= 500)) idxTransientAt = Date.now();
   if (!j || !Array.isArray(j.results)) return null;
   return j.results.map((r) => r.hits || []);
 }
@@ -736,9 +876,12 @@ const algoliaBatch = makeBatcher(
 
 // Várias buscas de um título. Devolve os hits sem repetição, ou null se o
 // índice estiver indisponível (aí entra o plano C).
-async function algoliaSearch(queries) {
+async function algoliaSearch(queries, ctx) {
   const lists = await Promise.all(queries.map((q) => algoliaBatch(JSON.stringify(q))));
-  if (lists.some((l) => l === undefined)) return null;
+  if (lists.some((l) => l === undefined)) {
+    if (ctx && recently(idxTransientAt)) ctx.transient = true; // índice caiu de verdade: não conclui "sem RT"
+    return null;
+  }
   const seen = new Set();
   const hits = [];
   for (const list of lists) {
@@ -765,7 +908,7 @@ function algoliaQueries(info, shownTitle) {
     info.enTitle,
     isLatin(info.originalTitle) ? info.originalTitle : null,
     ...(info.alt || []).slice(0, 2),
-    type === "movie" ? shownTitle : null,
+    type === "movie" || info.year ? shownTitle : null,
   ].filter(Boolean);
   const uniq = [];
   for (const n of names) if (!uniq.some((u) => normalize(u) === normalize(n))) uniq.push(n);
@@ -780,7 +923,7 @@ function algoliaQueries(info, shownTitle) {
 function pickAlgolia(hits, info, shownTitle) {
   const type = info.type === "movie" ? "movie" : "tv";
   const names = [info.enTitle, info.originalTitle, ...(info.alt || [])].filter(Boolean);
-  const local = type === "movie" && shownTitle ? [shownTitle] : [];
+  const local = shownTitle && (type === "movie" || info.year) ? [shownTitle] : [];
   let best = null;
   let bestScore = 0;
   for (const h of hits) {
@@ -830,14 +973,20 @@ function hitScores(h) {
 // ---------------------------------------------------------------------------
 
 // Com o endereço e (se houver) o resultado do índice: se o índice já trouxe
-// as duas notas, nem abre a página. Senão a página é a palavra final; série
-// sem nota de críticos da série inteira usa a média das temporadas.
-// Devolve { url, critics, audience, certified, criticsSeasons?, html } ou null
-// (html só pra quem precisa saber se a página existe).
+// as duas notas, nem abre a página. Depois olha o cache de nota (compartilhado
+// entre Netflix e Disney+). Senão a página é a palavra final; série sem nota de
+// críticos da série inteira usa a média das temporadas.
+// Devolve { url, critics, audience, certified, criticsSeasons?, pageOk } ou null.
 async function rtScoresForPath(path, hit, ctx) {
   const url = `${RT_BASE}/${path}`;
   const fromIndex = hitScores(hit);
-  if (fromIndex.critics !== null && fromIndex.audience !== null) return { url, ...fromIndex, pageOk: true };
+  if (fromIndex.critics !== null && fromIndex.audience !== null) {
+    const out = { url, ...fromIndex, pageOk: true };
+    storeScore(path, out, hit && hit.releaseYear);
+    return out;
+  }
+  const cached = await readScore(path, ctx);
+  if (cached && hasScore(cached)) return { url, ...cached, pageOk: true };
   const html = await getText(url, ctx);
   const page = parseRtScores(html);
   const out = page
@@ -852,6 +1001,7 @@ async function rtScoresForPath(path, hit, ctx) {
       out.criticsSeasons = { rated: s.rated, total: s.total };
     }
   }
+  if (hasScore(out)) storeScore(path, out, (page && page.year) || (hit && hit.releaseYear) || ctx.year);
   return out;
 }
 
@@ -881,47 +1031,59 @@ async function firstScored(paths, hits, ctx, tried) {
 }
 
 // Junta Wikidata + índice. Retorna { url, critics, audience, certified,
-// criticsSeasons?, via } (notas podem vir nulas: está no RT sem avaliação) ou null.
+// criticsSeasons?, via } ou null. Quando as duas fontes não acham página com
+// nota, a busca HTML do próprio RT é a última tentativa antes das reservas.
 async function rtFind(info, shownTitle, ctx) {
   const [wdPaths, hits] = await Promise.all([
-    wikidataRtPaths(info).catch(() => []),
-    algoliaSearch(algoliaQueries(info, shownTitle)),
+    wikidataRtPaths(info, ctx).catch(() => []),
+    algoliaSearch(algoliaQueries(info, shownTitle), ctx),
   ]);
   const tried = new Set();
 
   const fromWd = wdPaths.length ? await firstScored(wdPaths, hits, ctx, tried) : null;
   if (hasScore(fromWd)) return { ...fromWd, via: "wikidata" };
 
+  // Wikidata sem endereço, endereço desatualizado ou página sem nota:
+  // o índice decide (se achar outra página da mesma obra com nota)
+  let fromIdx = null;
   if (hits) {
-    // Wikidata sem endereço, endereço desatualizado ou página sem nota:
-    // o índice decide (se achar outra página da mesma obra com nota)
     const hit = pickAlgolia(hits, info, shownTitle);
     if (hit && !tried.has(hitPath(hit))) {
-      const r = await rtScoresForPath(hitPath(hit), hit, ctx);
-      if (hasScore(r) || !fromWd) return { ...r, via: "rt-index" };
+      fromIdx = await rtScoresForPath(hitPath(hit), hit, ctx);
+      if (hasScore(fromIdx)) return { ...fromIdx, via: "rt-index" };
     }
-    return fromWd ? { ...fromWd, via: "wikidata" } : null;
   }
-  if (fromWd) return { ...fromWd, via: "wikidata" };
-  const old = await rtLegacyLookup(info, ctx); // índice fora: plano C
-  return old ? { ...old, via: "rt-search" } : null;
+
+  if (!fromWd && !fromIdx) {
+    const old = await rtLegacyLookup(info, ctx, { guess: !hits }); // plano C: busca HTML do RT
+    if (hasScore(old)) return { ...old, via: "rt-search" };
+  }
+  if (fromWd || fromIdx) ctx.rtNoScore = true; // a obra está no RT, sem nenhuma avaliação
+  if (ctx.wdTransient && !hasScore(fromIdx)) ctx.transient = true; // Wikidata caiu: não dá pra afirmar que o RT não tem
+  return null;
 }
 
-// TMDB não achou a obra: tenta o nome exibido direto no índice do RT, que
-// guarda nomes em português nos apelidos. Só aceita casamento exato e único.
-async function rtByShownTitle(q) {
+// TMDB não achou a obra: tenta o nome exibido (e variantes seguras) direto no
+// índice do RT, que guarda nomes em português nos apelidos. Só aceita
+// casamento exato e único.
+async function rtByShownTitle(q, ctx = {}) {
   const types = q.mediaType ? [q.mediaType] : ["movie", "tv"];
-  const hits = await algoliaSearch([
-    { query: q.title, filters: types.length === 1 ? `type:${types[0]}` : undefined, hits: 10 },
-  ]);
+  const titles = [q.title, ...nameVariants(q.title).filter((v) => v.safe).map((v) => v.t).slice(0, 2)];
+  const hits = await algoliaSearch(
+    titles.map((t) => ({ query: t, filters: types.length === 1 ? `type:${types[0]}` : undefined, hits: 10 })),
+    ctx
+  );
   if (!hits) return null;
   const found = hits.filter(
     (h) =>
       types.includes(h.type) &&
-      [h.title, ...(h.titles || []), ...(h.aka || [])].some((x) => sameTitle(q.title, x)) &&
+      [h.title, ...(h.titles || []), ...(h.aka || [])].some((x) => titles.some((t) => sameTitle(t, x))) &&
       (!q.year || !h.releaseYear || yearClose(h.releaseYear, q.year))
   );
-  if (found.length !== 1) return null; // ambíguo: melhor sem nota que nota errada
+  if (found.length !== 1) {
+    if (found.length > 1) ctx.ambiguous = true; // ambíguo: melhor sem nota que nota errada
+    return null;
+  }
   const h = found[0];
   return { hit: h, url: `${RT_BASE}/${hitPath(h)}`, ...hitScores(h) };
 }
@@ -973,48 +1135,307 @@ function rtResult(rt, match, year) {
   };
 }
 
-// Caminho rápido da Netflix: o card traz o id do título (/browse?jbv=ID) e o
-// Wikidata liga esse id direto à página do RT (P1874 -> P1258). Sem TMDB, sem
-// casamento por nome, sem homônimo errado. Devolve o resultado, ou null pra
-// seguir pelo caminho por nome.
-async function fetchByNetflixId(q, ctx) {
-  const wd = await wikidataBatch(`nf:${q.nfId}`);
-  if (!wd || !wd.paths.length) return null;
-  let hits = null;
-  if (wd.label) {
-    const types = [...new Set(wd.paths.map((p) => (p.startsWith("m/") ? "movie" : "tv")))];
-    hits = await algoliaSearch([
-      { query: wd.label, filters: types.length === 1 ? `type:${types[0]}` : undefined, hits: 10 },
-    ]);
+// ---------------------------------------------------------------------------
+// Arquivos do pacote: overrides.json e mapas estáticos (data/*.json)
+// ---------------------------------------------------------------------------
+
+const staticFiles = {};
+function loadStatic(name) {
+  if (!staticFiles[name]) {
+    staticFiles[name] = (async () => {
+      try {
+        const res = await fetch(chrome.runtime.getURL(name));
+        return res && res.ok ? await res.json() : null;
+      } catch (e) {
+        return null; // arquivo opcional ausente
+      }
+    })();
   }
-  const rt = await firstScored(wd.paths, hits, ctx, new Set());
-  if (!hasScore(rt)) return null;
-  const hit = (hits || []).find((h) => `${RT_BASE}/${hitPath(h)}` === rt.url);
-  ctx.via = "netflix-id";
-  const year = hit?.releaseYear || wd.year;
-  return rtResult(rt, matchLabel(hit?.title || wd.label, year), year);
+  return staticFiles[name];
 }
 
-// Caminho por nome: TMDB -> Wikidata/índice do RT -> OMDb -> TMDB.
+// ---------------------------------------------------------------------------
+// Correções manuais (overrides.json do pacote + as feitas no cartão da nota)
+// ---------------------------------------------------------------------------
+
+const OVR_KEY = "vop:ovr";
+let ovrMem = null;
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+
+async function userOverrides() {
+  if (!ovrMem) ovrMem = (await readStored(OVR_KEY)) || {};
+  return ovrMem;
+}
+
+// chaves do mais específico (id do serviço) ao mais genérico (nome)
+function overrideKeys(q) {
+  const t = normalize(q.title);
+  return [q.sid, `t:${q.site || ""}:${t}`, `t:${t}`].filter(Boolean);
+}
+
+async function findOverride(q) {
+  const keys = overrideKeys(q);
+  const user = await userOverrides();
+  for (const k of keys) if (has(user, k) && (user[k] === null || isRtPath(user[k]))) return { key: k, path: user[k], src: "user" };
+  const file = await loadStatic(OVERRIDES_FILE);
+  if (file) for (const k of keys) if (has(file, k) && (file[k] === null || isRtPath(file[k]))) return { key: k, path: file[k], src: "file" };
+  return null;
+}
+
+async function overrideScore(ov) {
+  if (ov.path === null) return { value: null, meta: { miss: "override_none", via: "override" } };
+  const ctx = { transient: false };
+  const { rt } = await scoreByPaths([ov.path], null, ctx);
+  if (!hasScore(rt)) {
+    return { value: null, meta: { miss: ctx.transient ? "transient" : "rt_no_score", provisional: ctx.transient, via: "override" } };
+  }
+  return { value: { ...rtResult(rt, `${ov.path} (manual)`, null), via: "override" }, meta: { via: "override" } };
+}
+
+async function setOverride(q, path) {
+  const user = await userOverrides();
+  user[q.sid || `t:${q.site || ""}:${normalize(q.title)}`] = path;
+  await chrome.storage.local.set({ [OVR_KEY]: user });
+  notifyUpdated();
+}
+
+async function clearOverride(q) {
+  const user = await userOverrides();
+  for (const k of overrideKeys(q)) delete user[k];
+  await chrome.storage.local.set({ [OVR_KEY]: user });
+  notifyUpdated();
+}
+
+// ---------------------------------------------------------------------------
+// Caches auxiliares: nota por endereço do RT e mapa título -> endereço
+// ---------------------------------------------------------------------------
+
+const memCache = new Map(); // chave -> { value, expires, stale, ... }
+
+const scoreKey = (path) => `${CACHE_PREFIX}score:${path}`;
+
+function rtTtlByYear(year) {
+  const age = new Date().getFullYear() - (year || 0);
+  if (!year || age <= 1) return 2 * DAY; // lançamento: a nota ainda muda
+  if (age <= 5) return 7 * DAY;
+  return 30 * DAY;
+}
+
+async function readScore(path, ctx) {
+  if (ctx && ctx.fresh) return null;
+  const k = scoreKey(path);
+  let e = memCache.get(k);
+  if (!e) {
+    e = await readStored(k);
+    if (e) memCache.set(k, e);
+  }
+  return e && Date.now() < e.expires ? e.value : null;
+}
+
+function storeScore(path, r, year) {
+  const k = scoreKey(path);
+  const now = Date.now();
+  const ttl = rtTtlByYear(year);
+  const entry = {
+    value: {
+      critics: r.critics,
+      audience: r.audience,
+      certified: !!r.certified,
+      ...(r.criticsSeasons ? { criticsSeasons: r.criticsSeasons } : {}),
+    },
+    expires: now + ttl,
+    stale: now + ttl,
+  };
+  memCache.set(k, entry);
+  writeStored(k, entry);
+}
+
+const mapKeyOf = (key) => key + "#map";
+
+async function readMap(key) {
+  const mk = mapKeyOf(key);
+  let e = memCache.get(mk);
+  if (!e) {
+    e = await readStored(mk);
+    if (e) memCache.set(mk, e);
+  }
+  return e && Date.now() < e.expires ? e : null;
+}
+
+function writeMap(key, value) {
+  if (!value || value.source !== "rt" || value.via === "omdb-rt" || value.via === "override") return;
+  const m = /^https:\/\/www\.rottentomatoes\.com\/((?:m|tv)\/[^/?#]+)$/.exec(value.url || "");
+  if (!m) return;
+  const now = Date.now();
+  const e = {
+    path: m[1],
+    match: value.match || null,
+    year: value.year || null,
+    label: String(value.match || "").replace(/\s*\(\d{4}\)$/, "") || null,
+    via: value.via || null,
+    expires: now + MAP_TTL,
+    stale: now + MAP_TTL,
+  };
+  memCache.set(mapKeyOf(key), e);
+  writeStored(mapKeyOf(key), e);
+}
+
+// ---------------------------------------------------------------------------
+// Resolução pelos ids do serviço (Netflix e Disney+) e pelo mapa
+// ---------------------------------------------------------------------------
+
+// Linha dos mapas estáticos: [endereço(s) separados por "|", nome em inglês, ano]
+function rowFromMap(r) {
+  return { paths: String(r[0] || "").split("|").filter(isRtPath), label: r[1] || null, year: r[2] || null, imdb: null };
+}
+
+function mergeRows(rows) {
+  const ok = rows.filter(Boolean);
+  if (!ok.length) return rows.some((r) => r === undefined) ? undefined : null;
+  const out = { paths: [], label: null, year: null, imdb: null };
+  for (const r of ok) {
+    for (const p of r.paths) if (!out.paths.includes(p)) out.paths.push(p);
+    out.label = out.label || r.label;
+    if (r.year && (!out.year || r.year < out.year)) out.year = r.year;
+  }
+  return out;
+}
+
+const isDpUuid = (id) => /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(id || "");
+
+// { paths, label, year } do serviço pro título, ou null/undefined
+async function idRow(q) {
+  if (q.nfId) {
+    const map = await loadStatic(NF_MAP_FILE);
+    if (map && map[q.nfId]) return rowFromMap(map[q.nfId]);
+    return wikidataBatch(`nf:${q.nfId}`);
+  }
+  if (q.dpId) {
+    const uuid = isDpUuid(q.dpId);
+    const map = await loadStatic(DP_MAP_FILE);
+    for (const k of uuid ? [`e:${q.dpId}`] : [`m:${q.dpId}`, `s:${q.dpId}`]) if (map && map[k]) return rowFromMap(map[k]);
+    const keys = uuid ? [`dpe:${q.dpId}`] : [`dpm:${q.dpId}`, `dps:${q.dpId}`];
+    return mergeRows(await Promise.all(keys.map((k) => wikidataBatch(k))));
+  }
+  return null;
+}
+
+// Notas dos endereços candidatos, com o índice do RT ajudando (1 POST em lote)
+async function scoreByPaths(paths, label, ctx) {
+  if (paths.length === 1) {
+    const c = await readScore(paths[0], ctx);
+    if (c && hasScore(c)) return { rt: { url: `${RT_BASE}/${paths[0]}`, ...c, pageOk: true }, hit: null };
+  }
+  let hits = null;
+  if (label) {
+    const types = [...new Set(paths.map((p) => (p.startsWith("m/") ? "movie" : "tv")))];
+    hits = await algoliaSearch([{ query: label, filters: types.length === 1 ? `type:${types[0]}` : undefined, hits: 10 }], ctx);
+  }
+  const rt = await firstScored(paths, hits, ctx, new Set());
+  const hit = rt ? (hits || []).find((h) => `${RT_BASE}/${hitPath(h)}` === rt.url) || null : null;
+  return { rt, hit };
+}
+
+// Caminho rápido: o card traz o id do título e o Wikidata (ou o mapa do
+// pacote) liga esse id direto à página do RT. Sem TMDB, sem casamento por
+// nome, sem homônimo errado. Devolve o resultado, ou null pra seguir.
+async function fetchById(q, ctx) {
+  const wd = await idRow(q);
+  if (!wd || !wd.paths.length) return null;
+  const { rt, hit } = await scoreByPaths(wd.paths, wd.label, ctx);
+  if (!hasScore(rt)) {
+    if (rt) ctx.rtNoScore = true;
+    return null;
+  }
+  ctx.via = q.nfId ? "netflix-id" : "disney-id";
+  const year = (hit && hit.releaseYear) || wd.year;
+  return rtResult(rt, matchLabel((hit && hit.title) || wd.label, year), year);
+}
+
+async function fetchByMap(m, ctx) {
+  const { rt } = await scoreByPaths([m.path], m.label, ctx);
+  if (!hasScore(rt)) return null; // página mudou de lugar: refaz o caminho completo
+  ctx.via = m.via;
+  ctx.year = m.year;
+  return rtResult(rt, m.match, m.year);
+}
+
+// ---------------------------------------------------------------------------
+// Netflix: tipo (filme/série) pela página pública do título
+// ---------------------------------------------------------------------------
+
+// O card da Netflix não traz tipo nem ano. A página pública /title/ID traz o
+// tipo em JSON-LD (Movie/TVSeries). O ano dela é o da chegada na Netflix, não
+// o da obra, então só o tipo é usado.
+async function netflixType(id, ctx) {
+  const key = `${CACHE_PREFIX}nftype:${id}`;
+  let e = memCache.get(key);
+  if (!e) {
+    e = await readStored(key);
+    if (e) memCache.set(key, e);
+  }
+  if (e && Date.now() < e.expires) return e.value;
+  const html = await getText(`https://www.netflix.com/title/${id}`, ctx, { soft: true, timeout: 8000 });
+  if (html == null) return null; // sem rede: não grava
+  let type = null;
+  for (const m of html.matchAll(/<script[^>]*application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const j = JSON.parse(m[1]);
+      const t = String((Array.isArray(j) ? j[0] : j)["@type"] || "");
+      if (/movie/i.test(t)) type = "movie";
+      else if (/series|season/i.test(t)) type = "tv";
+      if (type) break;
+    } catch (err) {
+      /* próximo bloco */
+    }
+  }
+  const now = Date.now();
+  const entry = { value: type, expires: now + 180 * DAY, stale: now + 180 * DAY };
+  memCache.set(key, entry);
+  writeStored(key, entry);
+  return type;
+}
+
+async function withNetflixType(q, ctx) {
+  if (q.site !== "netflix" || !q.nfId || q.mediaType) return q;
+  const t = await netflixType(q.nfId, ctx);
+  return t ? { ...q, mediaType: t, typeHard: true } : q;
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline por nome: TMDB -> Wikidata/índice do RT -> OMDb -> TMDB
+// ---------------------------------------------------------------------------
+
 async function fetchByTitle(q, ctx) {
-  const hit = await tmdbMatch(q, ctx);
+  q = await withNetflixType(q, ctx);
+  let hit = await tmdbMatch(q, ctx);
+  if (!hit) hit = await tmdbMatchVariants(q, ctx);
   if (!hit) {
     // obra fora do TMDB (ou nome que ele não reconhece): tenta direto no RT
-    const direct = await rtByShownTitle(q);
-    if (!hasScore(direct)) return null;
+    const direct = await rtByShownTitle(q, ctx);
+    if (!hasScore(direct)) {
+      ctx.miss = ctx.transient ? "transient" : ctx.ambiguous ? "ambiguous" : "no_tmdb_match";
+      return null;
+    }
     const h = direct.hit;
+    ctx.via = "rt-shown";
+    ctx.year = h.releaseYear || null;
     return rtResult(direct, matchLabel(h.title, h.releaseYear), h.releaseYear);
   }
   const info = await tmdbInfo(hit, ctx);
   ctx.info = info;
+  ctx.year = info.year;
   const match = matchLabel(info.enTitle || info.originalTitle, info.year);
 
   const rt = await rtFind(info, q.title, ctx);
-  ctx.via = rt?.via || null;
+  ctx.via = (rt && rt.via) || null;
   if (hasScore(rt)) return rtResult(rt, match, info.year);
 
+  // daqui pra baixo o RT não deu nota: registra o motivo
+  ctx.miss = ctx.transient ? "transient" : ctx.rtNoScore ? "rt_no_score" : "rt_absent";
   const omdb = info.imdbId ? await omdbLookup(info.imdbId, ctx) : null;
   if (omdb && omdb.critics !== null) {
+    ctx.via = "omdb-rt";
     return {
       source: "rt",
       critics: omdb.critics,
@@ -1027,6 +1448,7 @@ async function fetchByTitle(q, ctx) {
     };
   }
   if (omdb && omdb.imdbRating !== null && omdb.imdbVotes >= MIN_IMDB_VOTES) {
+    ctx.via = "imdb";
     return {
       source: "imdb",
       critics: null,
@@ -1038,6 +1460,7 @@ async function fetchByTitle(q, ctx) {
     };
   }
   if (info.tmdbRating && info.tmdbVotes >= MIN_TMDB_VOTES) {
+    ctx.via = "tmdb";
     return {
       source: "tmdb",
       critics: null,
@@ -1051,12 +1474,23 @@ async function fetchByTitle(q, ctx) {
   return null;
 }
 
-// O caminho da Netflix roda fora da fila (é barato e vai em lote); o caminho
-// por nome, que bate no TMDB, passa pela fila com limite de paralelismo.
+// Ordem: mapa gravado (só renova a nota) -> ids do serviço (rápido, em lote)
+// -> nome (TMDB, passa pela fila com limite de paralelismo).
 async function fetchScore(q, ctx) {
-  if (q.nfId) {
+  if (!ctx.force && !ctx.fresh) {
+    const m = await readMap(ctx.key);
+    if (m) {
+      try {
+        const v = await fetchByMap(m, ctx);
+        if (v) return v;
+      } catch (e) {
+        /* refaz pelo caminho completo */
+      }
+    }
+  }
+  if (q.nfId || q.dpId) {
     try {
-      const fast = await fetchByNetflixId(q, ctx);
+      const fast = await fetchById(q, ctx);
       if (fast) return fast;
     } catch (e) {
       /* segue pelo nome */
@@ -1069,8 +1503,7 @@ async function fetchScore(q, ctx) {
 // Fila, cache e deduplicação
 // ---------------------------------------------------------------------------
 
-const memCache = new Map(); // chave -> { value, expires, stale }
-const inFlight = new Map(); // chave -> Promise
+const inFlight = new Map(); // chave -> Promise<entry>
 const queue = [];
 let active = 0;
 
@@ -1094,22 +1527,33 @@ function enqueue(fn, priority) {
   });
 }
 
-// Netflix: a chave é o id do título (o mesmo card em qualquer idioma, sem
-// ambiguidade). Demais: nome + tipo + ano + site.
+// Netflix e Disney+: a chave é o id do título (o mesmo card em qualquer
+// idioma, e remakes homônimos não se misturam). Sem id: nome + tipo + ano + site.
 function cacheKey(q) {
-  if (q.nfId) return `${CACHE_PREFIX}nf:${q.nfId}`;
+  if (q.sid) return `${CACHE_PREFIX}${q.sid}`;
   return `${CACHE_PREFIX}${normalize(q.title)}|${q.mediaType || ""}|${q.year || ""}|${q.site || ""}`;
 }
 
-// Validade pela idade do título: nota de lançamento muda rápido, nota de
-// clássico quase nunca.
-function ttlFor(value, transient) {
-  if (!value) return transient ? TRANSIENT_TTL : NEGATIVE_TTL;
-  if (value.source !== "rt") return transient ? FALLBACK_TTL : 3 * DAY;
-  const age = new Date().getFullYear() - (value.year || 0);
-  if (!value.year || age <= 1) return 2 * DAY;
-  if (age <= 5) return 7 * DAY;
-  return 30 * DAY;
+// Validade pela idade do título e pela origem da nota.
+//  - RT: lançamento 2 dias, até 5 anos 7 dias, clássico 30.
+//  - Reserva (IMDb/TMDB): lançamento 12 h (o RT costuma ganhar nota logo),
+//    até 5 anos 3 dias, mais velho 14 dias. Se o RT falhou: provisória, 10 min.
+//  - Sem nota: falha temporária 15 min; título recente ou RT sem avaliação
+//    12 h; resto 1 dia.
+function ttlFor(value, transient, extra = {}) {
+  const age = extra.year ? new Date().getFullYear() - extra.year : null;
+  const recent = age !== null && age <= 1;
+  if (!value) {
+    if (transient) return TRANSIENT_TTL;
+    if (recent || (extra.miss === "rt_no_score" && age === null)) return 12 * 60 * MINUTE;
+    return NEGATIVE_TTL;
+  }
+  if (value.source === "rt") return rtTtlByYear(value.year);
+  if (transient) return PROVISIONAL_TTL;
+  const vage = value.year ? new Date().getFullYear() - value.year : null;
+  if (vage === null || vage <= 1) return 12 * 60 * MINUTE;
+  if (vage <= 5) return 3 * DAY;
+  return 14 * DAY;
 }
 
 async function readStored(key) {
@@ -1135,11 +1579,103 @@ async function writeStored(key, entry) {
   }
 }
 
-// Busca de verdade, com deduplicação; grava no cache.
-function refresh(q, key) {
+// ---------------------------------------------------------------------------
+// Aviso às abas: uma nota mudou (vop:updatedAt), o content refaz os badges
+// ---------------------------------------------------------------------------
+
+const UPDATED_KEY = "vop:updatedAt";
+let notifyTimer = null;
+
+function notifyUpdated() {
+  if (notifyTimer) return;
+  notifyTimer = setTimeout(() => {
+    notifyTimer = null;
+    try {
+      Promise.resolve(chrome.storage.local.set({ [UPDATED_KEY]: Date.now() })).catch(() => {});
+    } catch (e) {
+      /* sem aviso */
+    }
+  }, 800);
+}
+
+const sig = (v) => (v ? [v.source, v.critics, v.audience, v.rating, v.url].join("|") : "null");
+
+// ---------------------------------------------------------------------------
+// Estatísticas locais (nada sai da máquina): popup e exportação dos sem RT
+// ---------------------------------------------------------------------------
+
+const STATS_KEY = "vop:stats";
+const MISSES_KEY = "vop:misses";
+let statsChain = Promise.resolve();
+
+function dayKey(d = new Date()) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function bumpStats(q, entry) {
+  statsChain = statsChain.then(async () => {
+    try {
+      const v = entry.value;
+      const src = v ? v.source : "none";
+      const both = !!v && v.source === "rt" && typeof v.critics === "number" && typeof v.audience === "number";
+      const st = (await readStored(STATS_KEY)) || { days: {} };
+      const today = dayKey();
+      const day = st.days[today] || (st.days[today] = { n: 0, both: 0, site: {}, src: {}, via: {}, miss: {} });
+      const inc = (o, k) => {
+        o[k] = (o[k] || 0) + 1;
+      };
+      day.n++;
+      if (both) day.both++;
+      inc(day.site, q.site || "?");
+      inc(day.src, src);
+      inc(day.via, entry.via || "nome");
+      if (entry.miss) inc(day.miss, entry.miss);
+      for (const k of Object.keys(st.days).sort().slice(0, -14)) delete st.days[k];
+      await chrome.storage.local.set({ [STATS_KEY]: st });
+
+      const list = (await readStored(MISSES_KEY)) || [];
+      const id = q.sid || `${q.site || ""}:${normalize(q.title)}`;
+      const i = list.findIndex((m) => m.id === id);
+      if (i >= 0) list.splice(i, 1);
+      if (src !== "rt") {
+        list.push({
+          id,
+          title: q.title,
+          site: q.site || null,
+          src,
+          miss: entry.miss || null,
+          match: (v && v.match) || null,
+          url: (v && v.url) || null,
+          provisional: !!entry.provisional,
+          at: Date.now(),
+        });
+        while (list.length > 300) list.shift();
+      }
+      if (i >= 0 || src !== "rt") await chrome.storage.local.set({ [MISSES_KEY]: list });
+    } catch (e) {
+      /* estatística é opcional */
+    }
+  });
+}
+
+// conta o título uma vez por dia (a 1ª vez que aparece)
+function track(q, key, entry) {
+  const day = dayKey();
+  if (entry.seenDay === day) return;
+  entry.seenDay = day;
+  bumpStats(q, entry);
+  writeStored(key, entry);
+}
+
+// ---------------------------------------------------------------------------
+// Busca de verdade, com deduplicação; grava no cache
+// ---------------------------------------------------------------------------
+
+function refresh(q, key, opts = {}) {
   if (inFlight.has(key)) return inFlight.get(key);
   const p = (async () => {
-    const ctx = { transient: false };
+    const ctx = { transient: false, key, force: !!opts.force, fresh: !!opts.fresh };
     let value;
     try {
       value = await fetchScore(q, ctx);
@@ -1147,43 +1683,88 @@ function refresh(q, key) {
       return undefined; // exceção inesperada: não cacheia
     }
     const now = Date.now();
-    const ttl = ttlFor(value, ctx.transient);
-    const entry = { value, expires: now + ttl, stale: now + ttl + STALE_GRACE };
+    const provisional = ctx.transient && (!value || value.source !== "rt");
+    if (value) value = { ...value, via: ctx.via || null };
+    const ttl = ttlFor(value, ctx.transient, { miss: ctx.miss, year: ctx.year });
+    const isRt = !!value && value.source === "rt";
+    const entry = {
+      value,
+      expires: now + ttl,
+      stale: now + ttl + STALE_GRACE,
+      via: ctx.via || null,
+      miss: isRt ? null : ctx.miss || (ctx.transient ? "transient" : "rt_absent"),
+      provisional,
+      hints: { year: q.year || null, type: q.mediaType || null },
+      variant: ctx.variant || null,
+      seenDay: dayKey(),
+    };
+    const prev = memCache.get(key);
     memCache.set(key, entry);
     writeStored(key, entry);
-    return value;
+    if (isRt && !provisional) writeMap(key, value);
+    if (prev && sig(prev.value) !== sig(value)) notifyUpdated(); // nota vencida mudou, ou o detalhe corrigiu o card
+    if (!prev || prev.seenDay !== entry.seenDay) bumpStats(q, entry); // 1x por título por dia
+    return entry;
   })().finally(() => inFlight.delete(key));
   inFlight.set(key, p);
   return p;
 }
 
-// Cache com "mostra a antiga e atualiza por trás": nota vencida (mas não
-// velha demais) volta na hora e a busca nova roda em segundo plano; a
-// próxima visita já vê a atualizada.
-async function getScore(q) {
-  const key = cacheKey(q);
-  const now = Date.now();
-  let entry = memCache.get(key);
-  if (!entry) {
-    entry = await readStored(key);
-    if (entry) memCache.set(key, entry);
-  }
-  if (entry && now < entry.expires) return entry.value;
-  if (entry && entry.value && now < (entry.stale || 0)) {
-    refresh(q, key);
-    return entry.value;
-  }
-  const v = await refresh(q, key);
-  return v === undefined ? null : v;
+const pack = (entry) => ({
+  value: entry.value ?? null,
+  meta: { miss: entry.miss || null, provisional: !!entry.provisional, via: entry.via || null },
+});
+
+// No detalhe (que traz ano e tipo) um card resolvido só pelo nome pode estar
+// com a obra errada (remake homônimo): refaz uma vez com as dicas novas.
+function needsHintRefresh(entry, q) {
+  if (!q.sid) return false;
+  if (entry.via === "netflix-id" || entry.via === "disney-id" || entry.via === "override") return false;
+  const h = entry.hints || {};
+  return !!((q.year && !h.year) || (q.mediaType && !h.type));
 }
 
-// Apaga entradas velhas demais e de versões antigas do cache.
+// Cache com "mostra a antiga e atualiza por trás": nota vencida (mas não
+// velha demais) volta na hora e a busca nova roda em segundo plano; quando a
+// nota muda, as abas abertas são avisadas.
+// opts: retry (o content pede de novo: ignora entrada provisória), fresh
+// (benchmark: ignora todos os caches).
+async function getScore(q, opts = {}) {
+  const ov = await findOverride(q);
+  if (ov) return overrideScore(ov);
+  const key = cacheKey(q);
+  const now = Date.now();
+  let entry = null;
+  if (!opts.fresh) {
+    entry = memCache.get(key);
+    if (!entry) {
+      entry = await readStored(key);
+      if (entry) memCache.set(key, entry);
+    }
+  }
+  const hintRefresh = !!entry && needsHintRefresh(entry, q);
+  const usable = !!entry && !opts.fresh && !hintRefresh && !(opts.retry && entry.provisional);
+  if (usable && now < entry.expires) {
+    track(q, key, entry);
+    return pack(entry);
+  }
+  if (usable && entry.value && now < (entry.stale || 0)) {
+    refresh(q, key);
+    track(q, key, entry);
+    return pack(entry);
+  }
+  const e = await refresh(q, key, { force: hintRefresh || !!opts.fresh, fresh: !!opts.fresh });
+  return e ? pack(e) : { value: null, meta: { miss: "error" } };
+}
+
+// Apaga entradas velhas demais e de versões antigas do cache. Chaves "vop:"
+// (estatísticas, correções, credenciais do índice) nunca são apagadas.
 async function pruneCache() {
   try {
     const all = await chrome.storage.local.get(null);
     const now = Date.now();
     const stale = Object.keys(all).filter((k) => {
-      if (k === CLEARED_KEY || k === ALGOLIA_CREDS_KEY) return false;
+      if (k.startsWith(PROTECTED_PREFIX)) return false;
       if (!k.startsWith(CACHE_PREFIX)) return true;
       const e = all[k];
       return !(e && Math.max(e.expires || 0, e.stale || 0) > now);
@@ -1196,7 +1777,9 @@ async function pruneCache() {
 
 async function clearCache() {
   memCache.clear();
-  await chrome.storage.local.clear();
+  const all = await chrome.storage.local.get(null);
+  const drop = Object.keys(all).filter((k) => !k.startsWith(PROTECTED_PREFIX));
+  if (drop.length) await chrome.storage.local.remove(drop);
   await chrome.storage.local.set({ [CLEARED_KEY]: Date.now() });
 }
 
@@ -1207,25 +1790,65 @@ async function clearCache() {
 chrome.runtime.onInstalled.addListener(() => pruneCache());
 chrome.runtime.onStartup.addListener(() => pruneCache());
 
+function queryFromMsg(msg) {
+  const nfId = msg.site === "netflix" && /^\d{5,10}$/.test(String(msg.nfId || "")) ? String(msg.nfId) : null;
+  const dpId = msg.site === "disney" && /^[0-9a-zA-Z-]{8,40}$/.test(String(msg.dpId || "")) ? String(msg.dpId) : null;
+  return {
+    title: String(msg.title).replace(/[’‘`´]/g, "'").replace(/[“”]/g, '"').trim().slice(0, 200),
+    year: Number.isInteger(msg.year) ? msg.year : null,
+    mediaType: msg.mediaType === "movie" || msg.mediaType === "tv" ? msg.mediaType : null,
+    priority: msg.priority === "high" ? "high" : "normal",
+    site: msg.site === "netflix" || msg.site === "disney" ? msg.site : null,
+    nfId,
+    dpId,
+    sid: nfId ? `nf:${nfId}` : dpId ? `dp:${dpId}` : null,
+  };
+}
+
+const okFlag = (sendResponse) => ({
+  yes: () => sendResponse({ ok: true }),
+  no: () => sendResponse({ ok: false }),
+});
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "getScore" && typeof msg.title === "string" && msg.title.trim()) {
-    const q = {
-      title: msg.title.replace(/[’‘`´]/g, "'").replace(/[“”]/g, '"').trim().slice(0, 200),
-      year: Number.isInteger(msg.year) ? msg.year : null,
-      mediaType: msg.mediaType === "movie" || msg.mediaType === "tv" ? msg.mediaType : null,
-      priority: msg.priority === "high" ? "high" : "normal",
-      site: msg.site === "netflix" || msg.site === "disney" ? msg.site : null,
-      nfId: msg.site === "netflix" && /^\d{5,10}$/.test(String(msg.nfId || "")) ? String(msg.nfId) : null,
-    };
-    getScore(q)
-      .then((value) => sendResponse({ ok: true, value: value || null }))
+    getScore(queryFromMsg(msg), { retry: !!msg.retry, fresh: !!msg.fresh })
+      .then((r) =>
+        sendResponse({
+          ok: true,
+          value: r.value || null,
+          miss: r.meta.miss || null,
+          provisional: !!r.meta.provisional,
+          via: r.meta.via || null,
+        })
+      )
       .catch(() => sendResponse({ ok: false, value: null }));
     return true; // resposta assíncrona
   }
   if (msg?.type === "clearCache") {
-    clearCache()
-      .then(() => sendResponse({ ok: true }))
+    const r = okFlag(sendResponse);
+    clearCache().then(r.yes, r.no);
+    return true;
+  }
+  if (msg?.type === "getStats") {
+    Promise.all([readStored(STATS_KEY), readStored(MISSES_KEY)])
+      .then(([stats, misses]) => sendResponse({ ok: true, stats: stats || { days: {} }, misses: misses || [] }))
       .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+  if (msg?.type === "clearStats") {
+    const r = okFlag(sendResponse);
+    chrome.storage.local.remove([STATS_KEY, MISSES_KEY]).then(r.yes, r.no);
+    return true;
+  }
+  if (msg?.type === "setOverride" && typeof msg.title === "string" && isRtPath(String(msg.path || ""))) {
+    const r = okFlag(sendResponse);
+    setOverride(queryFromMsg(msg), String(msg.path)).then(r.yes, r.no);
+    return true;
+  }
+  if (msg?.type === "clearOverride" && typeof msg.title === "string") {
+    const r = okFlag(sendResponse);
+    clearOverride(queryFromMsg(msg)).then(r.yes, r.no);
     return true;
   }
   return false;

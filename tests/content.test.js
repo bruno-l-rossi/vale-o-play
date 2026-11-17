@@ -7,6 +7,7 @@ const path = require("path");
 const { JSDOM } = require("jsdom");
 
 const SRC = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
+const ICONS_SRC = fs.readFileSync(path.join(__dirname, "..", "icons.js"), "utf8");
 const windows = [];
 test.after(() => windows.forEach((w) => w.close()));
 
@@ -22,7 +23,7 @@ const SCORES = {
   Futurama: { source: "rt", critics: 40, audience: 85 },
 };
 
-async function setup(url, html, { settings = {}, scores = SCORES } = {}) {
+async function setup(url, html, { settings = {}, scores = SCORES, reply = null } = {}) {
   const dom = new JSDOM(`<!doctype html><html><head><title>Netflix</title></head><body>${html}</body></html>`, {
     url,
     runScripts: "outside-only",
@@ -32,6 +33,7 @@ async function setup(url, html, { settings = {}, scores = SCORES } = {}) {
   windows.push(window);
   const asked = [];
   const syncListeners = [];
+  const saved = [];
   window.IntersectionObserver = class {
     constructor(cb) { this.cb = cb; }
     observe(el) { setTimeout(() => this.cb([{ isIntersecting: true, target: el }]), 0); }
@@ -43,15 +45,20 @@ async function setup(url, html, { settings = {}, scores = SCORES } = {}) {
       lastError: null,
       sendMessage(msg, cb) {
         asked.push(msg);
-        setTimeout(() => cb({ ok: true, value: scores[msg.title] || null }), 5);
+        if (msg.type && msg.type !== "getScore") return setTimeout(() => cb({ ok: true }), 1);
+        setTimeout(() => cb(reply ? reply(msg) : { ok: true, value: scores[msg.title] || null }), 5);
       },
     },
     storage: {
-      sync: { get(defaults, cb) { setTimeout(() => cb({ ...defaults, ...settings }), 0); } },
+      sync: {
+        get(defaults, cb) { setTimeout(() => cb({ ...defaults, ...settings }), 0); },
+        set(values, cb) { saved.push(values); cb && cb(); },
+      },
       onChanged: { addListener(fn) { syncListeners.push(fn); } },
     },
   };
   window.open = (u) => (window.__opened = u);
+  window.eval(ICONS_SRC);
   window.eval(SRC);
   await settle();
   const changeSettings = async (changes) => {
@@ -60,12 +67,24 @@ async function setup(url, html, { settings = {}, scores = SCORES } = {}) {
     syncListeners.forEach((fn) => fn(c, "sync"));
     await settle();
   };
-  return { window, doc: window.document, asked, changeSettings, settle };
+  const changeLocal = async (changes) => {
+    const c = {};
+    for (const [k, v] of Object.entries(changes)) c[k] = { newValue: v };
+    syncListeners.forEach((fn) => fn(c, "local"));
+    await settle(1800);
+  };
+  return { window, doc: window.document, asked, saved, changeSettings, changeLocal, settle };
 }
 
 const settle = (ms = 450) => new Promise((r) => setTimeout(r, ms));
 // texto das partes do badge/linha, separadas por espaço (o espaçamento visual é CSS)
-const partsText = (el) => (el ? [...el.querySelectorAll(".vop-part")].map((p) => p.textContent.trim()).join(" ") : null);
+const EMOJI = { fresh: "🍅", rotten: "🟢", popcorn: "🍿", spilled: "🥤", trophy: "🏆" };
+const partsText = (el) =>
+  el
+    ? [...el.querySelectorAll(".vop-part")]
+        .map((p) => `${EMOJI[p.querySelector("svg")?.dataset.icon] || ""} ${p.textContent}`.trim())
+        .join(" ")
+    : null;
 const badgeText = (el) => partsText(el?.querySelector(".vop-badge")) ?? null;
 
 // ---------------- Netflix ----------------
@@ -92,7 +111,7 @@ test("Netflix 2026: badge em cada card standard/ranked/progress, nada no billboa
   const { doc, asked } = await setup("https://www.netflix.com/browse", NETFLIX_2026);
   assert.equal(badgeText(doc.getElementById("c1")), "🍅 75% 🍿 67%");
   assert.equal(badgeText(doc.getElementById("c2")), "🏆 🍅 91% 🍿 92%");
-  assert.equal(badgeText(doc.getElementById("c3")), "⭐ 7,8IMDb");
+  assert.equal(badgeText(doc.getElementById("c3")), "IMDb 7,8");
   assert.equal(badgeText(doc.getElementById("c4")), null); // sem nota: sem badge
   assert.equal(doc.querySelectorAll(".vop-badge").length, 3);
   assert.equal(doc.querySelector(".billboard .vop-badge"), null);
@@ -102,7 +121,8 @@ test("Netflix 2026: badge em cada card standard/ranked/progress, nada no billboa
   // o card do aclamado ganha a classe dourada; o badge tem dica da fonte
   const top = doc.querySelector("#c2 .vop-badge");
   assert.ok(top.classList.contains("vop-top"));
-  assert.match(top.title, /Rotten Tomatoes · Stranger Things \(2016\)/);
+  assert.match(top.getAttribute("aria-label"), /Rotten Tomatoes, Stranger Things \(2016\)/);
+  assert.equal(top.getAttribute("role"), "button");
 });
 
 test("Netflix: clique no badge abre a fonte e não deixa o clique cair no card", async () => {
@@ -210,7 +230,7 @@ const DISNEY_TILES = `
 test("Disney+: tiles (logado e público), sem marcas nem menu", async () => {
   const { doc, asked } = await setup("https://www.disneyplus.com/pt-br/home", DISNEY_TILES);
   assert.equal(badgeText(doc.getElementById("d1")), "🍿 65%");
-  assert.equal(badgeText(doc.getElementById("d2")), "★ 7,4TMDB");
+  assert.equal(badgeText(doc.getElementById("d2")), "TMDB 7,4");
   assert.equal(badgeText(doc.getElementById("d3")), "🟢 40% 🍿 85%");
   assert.equal(badgeText(doc.getElementById("brand")), null);
   assert.equal(doc.querySelector("nav .vop-badge"), null);
@@ -272,10 +292,10 @@ test("nota de críticos vinda da média das temporadas: asterisco e dica explica
   </div>`;
   const { doc } = await setup("https://www.netflix.com/browse", html, { scores });
   const crit = doc.querySelector("#s1 .vop-part");
-  assert.equal(crit.textContent, "🍅 85%*");
-  assert.equal(crit.title, "Críticos: média das 21 temporadas com nota no RT (de 38)");
+  assert.equal(partsText(doc.querySelector("#s1 .vop-badge")).split(" 🍿")[0], "🍅 85%*");
+  assert.equal(crit.dataset.tip, "Críticos: média das 21 temporadas com nota no RT (de 38)");
   const one = doc.querySelector("#s2 .vop-badge");
-  assert.equal(one.querySelector(".vop-part").title, "Críticos: só 1 das 24 temporadas tem nota no RT");
+  assert.equal(one.querySelector(".vop-part").dataset.tip, "Críticos: só 1 das 24 temporadas tem nota no RT");
   assert.ok(!one.classList.contains("vop-top"), "uma temporada só não dá troféu");
 });
 
@@ -285,11 +305,124 @@ test("Netflix manda o código do título junto com o nome; Disney+ não", async 
   assert.equal(genie.nfId, "81748484");
   assert.equal(genie.site, "netflix");
   const dp = await setup("https://www.disneyplus.com/pt-br/home", DISNEY_TILES);
-  assert.ok(dp.asked.every((m) => !m.nfId && m.site === "disney"));
+  assert.ok(dp.asked.every((m) => !m.nfId && m.dpId && m.site === "disney"));
+  assert.equal(dp.asked.find((m) => m.title === "Family Guy").dpId, "3c3c0f8b-7366-4d15-88ab-18050285978e");
 });
 
 test("site desconhecido: script não faz nada", async () => {
   const { doc, asked } = await setup("https://example.com/", NETFLIX_2026);
   assert.equal(asked.length, 0);
   assert.equal(doc.querySelectorAll(".vop-badge").length, 0);
+});
+
+// ---------------- v4.0: cartão, esconder, corrigir, filtro, billboard ----------------
+
+const openCardOf = async (window, doc, sel) => {
+  doc.querySelector(sel).dispatchEvent(new window.MouseEvent("mouseenter", { bubbles: false }));
+  await settle(300);
+  return doc.querySelector(".vop-card");
+};
+const cardBtn = (doc, text) => [...doc.querySelectorAll(".vop-card-btn")].find((b) => b.textContent.includes(text));
+
+test("cartão de origem: abre no hover com a fonte e as ações; Esc/saída fecha", async () => {
+  const { window, doc } = await setup("https://www.netflix.com/browse", NETFLIX_2026);
+  const card = await openCardOf(window, doc, "#c1 .vop-badge");
+  assert.ok(card, "cartão aberto");
+  assert.match(card.textContent, /Rotten Tomatoes/);
+  assert.match(card.textContent, /Genie, Make a Wish \(2025\)/);
+  for (const t of ["Abrir no Rotten Tomatoes", "Corrigir pelo link do RT", "Esconder nota deste título", "Nota errada? Avisar"]) {
+    assert.ok(cardBtn(doc, t), t);
+  }
+  doc.querySelector("#c1 .vop-badge").dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  assert.equal(doc.querySelector(".vop-card"), null);
+});
+
+test("esconder nota deste título: some o badge e grava a chave pelo ID do serviço", async () => {
+  const { window, doc, saved } = await setup("https://www.netflix.com/browse", NETFLIX_2026);
+  await openCardOf(window, doc, "#c1 .vop-badge");
+  cardBtn(doc, "Esconder nota").click();
+  await settle(1800);
+  assert.equal(JSON.stringify(saved.at(-1).hidden), JSON.stringify(["nf:81748484"]));
+  assert.equal(doc.querySelector("#c1 .vop-badge"), null);
+  assert.ok(doc.querySelector("#c2 .vop-badge"), "os outros seguem");
+});
+
+test("corrigir pelo link do RT: manda setOverride com o caminho; link inválido é recusado", async () => {
+  const { window, doc, asked } = await setup("https://www.netflix.com/browse", NETFLIX_2026);
+  let alerted = null;
+  window.alert = (m) => (alerted = m);
+  window.prompt = () => "https://www.rottentomatoes.com/tv/genie_make_a_wish?x=1";
+  await openCardOf(window, doc, "#c1 .vop-badge");
+  cardBtn(doc, "Corrigir").click();
+  const ovr = asked.find((m) => m.type === "setOverride");
+  assert.equal(ovr.path, "tv/genie_make_a_wish");
+  assert.equal(ovr.nfId, "81748484");
+  const n = asked.length;
+  window.prompt = () => "https://example.com/x";
+  await openCardOf(window, doc, "#c1 .vop-badge");
+  cardBtn(doc, "Corrigir").click();
+  assert.ok(alerted, "avisou que não reconheceu");
+  assert.equal(asked.length, n, "nada enviado");
+});
+
+test("filtro: nota usada, esconder em vez de esmaecer e títulos sem nota", async () => {
+  const { doc, changeSettings } = await setup("https://www.netflix.com/browse", NETFLIX_2026);
+  await changeSettings({ dimThreshold: "70", dimMetric: "audience", dimAction: "hide" });
+  assert.ok(doc.getElementById("c1").classList.contains("vop-hide")); // audiência 67 < 70
+  assert.ok(!doc.getElementById("c2").classList.contains("vop-hide")); // 92
+  assert.ok(!doc.getElementById("c4").classList.contains("vop-hide"), "sem nota não é filtrado por padrão");
+  await changeSettings({ dimUnrated: true, dimAction: "dim" });
+  assert.ok(doc.getElementById("c4").classList.contains("vop-dim"), "agora sem nota também");
+  assert.ok(!doc.getElementById("c1").classList.contains("vop-hide"));
+  await changeSettings({ dimMetric: "min", dimThreshold: "70", dimUnrated: false });
+  assert.ok(doc.getElementById("c1").classList.contains("vop-dim")); // min(75,67)
+  assert.ok(!doc.getElementById("c2").classList.contains("vop-dim")); // min(91,92)
+});
+
+test("mostrar traço quando não há nota; nota que muda em segundo plano atualiza a tela", async () => {
+  const live = { ...SCORES };
+  const { doc, asked, changeSettings, changeLocal } = await setup("https://www.netflix.com/browse", NETFLIX_2026, { scores: live });
+  assert.equal(doc.querySelector("#c4 .vop-badge"), null);
+  await changeSettings({ showMissing: true });
+  await settle(1800);
+  assert.ok(doc.querySelector("#c4 .vop-state.vop-none"), "traço no sem nota");
+  live["Título Sem Nota"] = { source: "rt", critics: 88, audience: 90, url: "https://rt/new" };
+  const n = asked.length;
+  await changeLocal({ "vop:updatedAt": Date.now() });
+  assert.ok(asked.length > n, "refez os pedidos");
+  assert.equal(badgeText(doc.getElementById("c4")), "🍅 88% 🍿 90%");
+  assert.equal(doc.querySelector("#c4 .vop-state"), null, "o traço some");
+});
+
+test("reserva provisória: badge translúcido e explicação no cartão", async () => {
+  const reply = () => ({ ok: true, value: { source: "imdb", rating: 8.1, url: "https://imdb/x" }, provisional: true, miss: "transient" });
+  const { window, doc } = await setup("https://www.netflix.com/browse", NETFLIX_2026, { reply });
+  const b = doc.querySelector("#c1 .vop-badge");
+  assert.ok(b.classList.contains("vop-provisional"));
+  const card = await openCardOf(window, doc, "#c1 .vop-badge");
+  assert.match(card.textContent, /Provisório/);
+  assert.match(card.textContent, /não respondeu/);
+});
+
+test("Netflix: billboard do topo ganha a linha de notas antes da sinopse", async () => {
+  const html = `<div class="billboard-row"><div class="billboard" data-uia="our-billboard">
+    <img class="title-logo" alt="Stranger Things" src="logo.png">
+    <p class="synopsis">Quando um garoto desaparece...</p>
+    <a href="/watch/80057281">Assistir</a><img src="hero.jpg"></div></div>`;
+  const { doc, asked } = await setup("https://www.netflix.com/browse", html);
+  const row = doc.querySelector(".billboard .vop-inline");
+  assert.ok(row, "linha criada no billboard");
+  assert.equal(row.nextElementSibling.className, "synopsis");
+  assert.equal(partsText(row), "🏆 🍅 91% 🍿 92%");
+  assert.equal(doc.querySelectorAll(".billboard .vop-badge").length, 0, "o billboard não vira card");
+  assert.ok(asked.some((m) => m.title === "Stranger Things" && m.nfId === "80057281" && m.priority === "high"));
+});
+
+test("Netflix: billboard sem título ou sem âncora não faz nada nem quebra", async () => {
+  const { doc, asked } = await setup(
+    "https://www.netflix.com/browse",
+    `<div class="billboard" data-uia="our-billboard"><a href="/watch/1"></a><img src="hero.jpg"></div>`
+  );
+  assert.equal(doc.querySelectorAll(".vop-inline, .vop-badge").length, 0);
+  assert.equal(asked.length, 0);
 });

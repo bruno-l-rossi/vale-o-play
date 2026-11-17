@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <title>Vale o Play? - bench</title>
+  <style>
+    body { font: 13px system-ui, sans-serif; margin: 20px; background: #141414; color: #eee; }
+    button { padding: 6px 12px; margin-right: 8px; }
+    table { border-collapse: collapse; margin-top: 12px; }
+    td, th { padding: 3px 10px; border-bottom: 1px solid #333; text-align: left; }
+    .bad { color: #ff6b6b; }
+    pre { background: #1e1e1e; padding: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Bench de cobertura</h1>
+  <p>Roda dentro da extensão (usa o service worker e o cache de verdade). Abra por <code>chrome-extension://&lt;id&gt;/tools/bench.html</code> (o id está em chrome://extensions).</p>
+  <button id="run">Rodar (cache novo)</button><button id="runCached">Rodar (com cache)</button>
+  <pre id="summary"></pre>
+  <table id="rows"></table>
+  <script src="bench.js"></script>
+</body>
+</html>

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <style>
     body {
-      width: 250px;
+      width: 280px;
       margin: 0;
       padding: 14px 16px;
       background: #141414;
@@ -20,11 +20,7 @@
       font-size: 15px;
     }
     h1 span { color: #e50914; }
-    h1 small {
-      font-size: 10px;
-      font-weight: 400;
-      color: #777;
-    }
+    h1 small { font-size: 10px; font-weight: 400; color: #777; }
     fieldset {
       border: 1px solid #333;
       border-radius: 6px;
@@ -59,14 +55,10 @@
       border-radius: 4px;
       font-size: 13px;
     }
-    .hint {
-      margin: 4px 0 0;
-      font-size: 11px;
-      color: #888;
-      line-height: 1.4;
-    }
+    .hint { margin: 4px 0 0; font-size: 11px; color: #888; line-height: 1.4; }
     button {
       width: 100%;
+      margin-top: 4px;
       padding: 7px 0;
       background: #333;
       color: #fff;
@@ -76,6 +68,7 @@
       cursor: pointer;
     }
     button:hover { background: #444; }
+    button[hidden] { display: none; }
     #status {
       height: 14px;
       margin-top: 6px;
@@ -83,6 +76,13 @@
       color: #46d369;
       text-align: right;
     }
+    .stat-row { display: flex; justify-content: space-between; padding: 2px 0; }
+    .stat-row b { font-variant-numeric: tabular-nums; }
+    .bar { height: 6px; margin: 4px 0 8px; border-radius: 3px; background: #333; overflow: hidden; }
+    .bar > i { display: block; height: 100%; background: #46d369; }
+    .legend { display: grid; grid-template-columns: 22px 1fr; gap: 3px 6px; align-items: center; font-size: 12px; color: #ccc; }
+    .legend svg { width: 16px; height: 16px; }
+    .credit { margin: 6px 0 0; font-size: 10px; color: #666; line-height: 1.4; }
   </style>
 </head>
 <body>
@@ -92,6 +92,7 @@
     <legend>Mostrar notas em</legend>
     <label><input type="checkbox" name="enableNetflix" /> Netflix</label>
     <label><input type="checkbox" name="enableDisney" /> Disney+</label>
+    <label><input type="checkbox" name="showMissing" /> Mostrar traço quando não há nota</label>
   </fieldset>
 
   <fieldset>
@@ -111,25 +112,56 @@
 
   <fieldset>
     <legend>Filtro de qualidade</legend>
-    <select id="dimThreshold">
+    <select id="dimThreshold" aria-label="Corte do filtro">
       <option value="off">Desligado (padrão)</option>
-      <option value="40">Esmaecer abaixo de 40%</option>
-      <option value="50">Esmaecer abaixo de 50%</option>
-      <option value="60">Esmaecer abaixo de 60%</option>
-      <option value="70">Esmaecer abaixo de 70%</option>
-      <option value="80">Esmaecer abaixo de 80%</option>
+      <option value="40">Abaixo de 40%</option>
+      <option value="50">Abaixo de 50%</option>
+      <option value="60">Abaixo de 60%</option>
+      <option value="70">Abaixo de 70%</option>
+      <option value="80">Abaixo de 80%</option>
     </select>
-    <p class="hint">Escurece as capas com nota de críticos abaixo do corte (IMDb 7,0 conta como 70%). Passar o mouse devolve as cores.</p>
+    <select id="dimMetric" aria-label="Nota usada no filtro">
+      <option value="auto">Nota principal (críticos)</option>
+      <option value="critics">Só críticos</option>
+      <option value="audience">Só audiência</option>
+      <option value="min">A menor das duas</option>
+    </select>
+    <select id="dimAction" aria-label="O que fazer com a capa">
+      <option value="dim">Esmaecer a capa</option>
+      <option value="hide">Esconder a capa</option>
+    </select>
+    <label><input type="checkbox" name="dimUnrated" /> Aplicar também a títulos sem nota</label>
+    <p class="hint">IMDb e TMDB contam como porcentagem (7,0 = 70%). Passar o mouse numa capa esmaecida devolve as cores.</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Cobertura (últimos dias)</legend>
+    <div id="coverage"><p class="hint">Sem dados ainda. Navegue na Netflix ou na Disney+.</p></div>
+    <button id="exportMisses" type="button" hidden>Copiar títulos sem nota do RT</button>
+    <button id="clearStats" type="button" hidden>Zerar estatísticas</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Títulos escondidos</legend>
+    <div id="hiddenInfo" class="hint">Nenhum.</div>
+    <button id="restoreHidden" type="button" hidden>Mostrar notas de novo</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Legenda</legend>
+    <div class="legend" id="legend"></div>
   </fieldset>
 
   <fieldset>
     <legend>Cache</legend>
-    <button id="clearCache">Limpar cache de notas</button>
-    <p class="hint">Força buscar todas as notas de novo. As abas abertas se atualizam sozinhas.</p>
+    <button id="clearCache" type="button">Limpar cache de notas</button>
+    <p class="hint">Força buscar todas as notas de novo. Suas correções manuais e as estatísticas ficam.</p>
   </fieldset>
 
-  <div id="status"></div>
+  <div id="status" role="status"></div>
+  <p class="credit">Notas do Rotten Tomatoes. Dados de identificação de Wikidata e TMDB. Este produto usa a API do TMDB, mas não é endossado nem certificado por ela.</p>
 
+  <script src="icons.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

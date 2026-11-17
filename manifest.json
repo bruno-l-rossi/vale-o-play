@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Vale o Play?",
-  "version": "3.2.0",
+  "version": "4.0.0",
   "description": "Notas de críticos e audiência do Rotten Tomatoes (ou do IMDb) direto nos cards da Netflix e da Disney+.",
   "minimum_chrome_version": "110",
   "icons": {
@@ -18,7 +18,8 @@
     "https://www.omdbapi.com/*",
     "https://www.rottentomatoes.com/*",
     "https://*.algolia.net/*",
-    "https://query.wikidata.org/*"
+    "https://query.wikidata.org/*",
+    "https://www.netflix.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -39,6 +40,7 @@
         "https://www.disneyplus.com/*"
       ],
       "js": [
+        "icons.js",
         "content.js"
       ],
       "css": [

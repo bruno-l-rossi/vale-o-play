@@ -130,6 +130,10 @@ test("pickTmdb: nome exato ganha; parecido demais não passa (Marvel x Ms. Marve
 
 // ---- Pipeline completo com rede falsa ----
 
+// chaves de título no cache (fora o mapa por código e o cache de nota por página)
+const mainKeys = (bg) =>
+  Object.keys(bg.store).filter((k) => k.startsWith("v10:") && !k.includes("#map") && !k.includes(":score:"));
+
 function godfatherRoutes(extra = {}) {
   return {
     "search/multi": tmdbSearch([
@@ -168,7 +172,7 @@ test("pipeline: cache em memória/disco e deduplicação de pedidos simultâneos
   const n = bg.calls.length;
   await bg.send({ type: "getScore", title: "O Poderoso Chefão" });
   assert.equal(bg.calls.length, n, "segunda chamada não vai pra rede");
-  const keys = Object.keys(bg.store).filter((k) => k.startsWith("v9:"));
+  const keys = mainKeys(bg);
   assert.equal(keys.length, 1);
   assert.ok(bg.store[keys[0]].expires > Date.now() + 6 * 24 * 3600 * 1000);
 });
@@ -241,20 +245,24 @@ test("mensagens: título vazio é ignorado; aspas tipográficas viram retas; lim
   bg.store["v5:velho"] = { value: 1, expires: Date.now() + 1e9 };
   const res = await bg.send({ type: "clearCache" });
   assert.equal(res.ok, true);
-  assert.deepEqual(Object.keys(bg.store), ["vop:clearedAt"]);
+  assert.ok("vop:clearedAt" in bg.store);
+  assert.ok(Object.keys(bg.store).every((k) => k.startsWith("vop:")), "só sobra o que é do usuário (vop:)");
 });
 
 test("pruneCache tira versão antiga e vencido, mantém o válido", async () => {
   const bg = loadBackground();
   Object.assign(bg.store, {
     "v6:x": { value: 1, expires: Date.now() + 1e9 },
-    "v9:vencido": { value: 1, expires: Date.now() - 1 },
-    "v9:ok": { value: 1, expires: Date.now() + 1e9 },
+    "v9:antigo": { value: 1, expires: Date.now() + 1e9 },
+    "v10:vencido": { value: 1, expires: Date.now() - 1, stale: Date.now() - 1 },
+    "v10:ok": { value: 1, expires: Date.now() + 1e9 },
+    "vop:stats": { days: {} },
+    "vop:ovr": { x: "m/x" },
     "vop:clearedAt": 1,
     "vop:algolia": { aId: "X", sId: "y" },
   });
   await bg.run("pruneCache()");
-  assert.deepEqual(Object.keys(bg.store).sort(), ["v9:ok", "vop:algolia", "vop:clearedAt"]);
+  assert.deepEqual(Object.keys(bg.store).sort(), ["v10:ok", "vop:algolia", "vop:clearedAt", "vop:ovr", "vop:stats"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -389,7 +397,7 @@ test("Wikidata no limite de ritmo (429): tenta de novo uma vez e não marca erro
   const res = await bg.send({ type: "getScore", title: "Round 6" });
   assert.equal(n, 2);
   assert.equal(res.value.url, "https://www.rottentomatoes.com/tv/squid_game");
-  const entry = Object.entries(bg.store).find(([k]) => k.startsWith("v9:"))[1];
+  const entry = bg.store[mainKeys(bg)[0]];
   assert.ok(entry.expires > Date.now() + 6 * 24 * 3600 * 1000, "cache cheio de 7 dias");
 });
 
@@ -604,7 +612,7 @@ test("Netflix: o código do card vai direto ao RT pelo Wikidata, sem TMDB", asyn
   assert.equal(res.value.match, "Squid Game (2021)");
   assert.ok(!bg.calls.some((u) => u.includes("themoviedb")), "nenhuma chamada ao TMDB");
   assert.ok(!bg.calls.some((u) => u.includes("rottentomatoes.com/tv/")), "nem à página do RT");
-  assert.ok(Object.keys(bg.store).includes("v9:nf:81040344"), "cache pelo código");
+  assert.ok(Object.keys(bg.store).includes("v10:nf:81040344"), "cache pelo código");
 });
 
 test("Netflix: código que o Wikidata não conhece cai no caminho por nome", async () => {
@@ -640,7 +648,10 @@ test("validade pela idade do título", () => {
   assert.equal(ttl({ source: "rt", year: y }), 2);
   assert.equal(ttl({ source: "rt", year: y - 3 }), 7);
   assert.equal(ttl({ source: "rt", year: 1972 }), 30);
-  assert.equal(ttl({ source: "imdb", year: 1972 }), 3);
+  assert.equal(ttl({ source: "imdb", year: 1972 }), 14);
+  assert.equal(ttl({ source: "imdb", year: y - 3 }), 3);
+  assert.equal(ttl({ source: "imdb", year: y }), 0.5, "reserva de lançamento: 12 h");
+  assert.ok(ttl({ source: "imdb", year: 1972 }, true) < 0.01, "reserva provisória (RT falhou): 10 min");
   assert.equal(ttl(null), 1);
   assert.ok(ttl(null, true) < 0.02, "falha de rede: 15 min");
 });
@@ -650,7 +661,7 @@ test("nota vencida volta na hora e atualiza por trás", async () => {
   const routes = godfatherRoutes();
   routes["rottentomatoes.com/m/the_godfather"] = () => ({ text: rtPageFor(critics) });
   const bg = loadBackground({ routes });
-  const key = "v9:o poderoso chefao|||";
+  const key = "v10:o poderoso chefao|||";
   bg.store[key] = {
     value: { source: "rt", critics: 90, audience: 90, url: "x", year: 1972 },
     expires: Date.now() - 1000,
@@ -682,4 +693,159 @@ test("Wikidata com 2 endereços da mesma obra (um vazio): fica com o que tem not
   assert.equal(res.value.url, "https://www.rottentomatoes.com/tv/x_men");
   assert.equal(res.value.critics, 83);
   assert.ok(!bg.calls.some((u) => u.includes("x_men_1992")), "o índice já mostrou qual tem nota");
+});
+
+// ---------------------------------------------------------------------------
+// v4.0: disjuntor, reserva provisória, Disney+ por ID, correções, estatísticas
+// ---------------------------------------------------------------------------
+
+test("RT bloqueando (3 x 403): disjuntor abre e para de bater no RT por um tempo", async () => {
+  const bg = loadBackground({ routes: { "rottentomatoes.com": { status: 403 } } });
+  const ctx = {};
+  for (let i = 0; i < 3; i++) await bg.ctx.request("https://www.rottentomatoes.com/m/x" + i, ctx, "text");
+  const before = bg.calls.length;
+  const ctx2 = {};
+  const out = await bg.ctx.request("https://www.rottentomatoes.com/m/y", ctx2, "text");
+  assert.equal(out, null);
+  assert.equal(bg.calls.length, before, "disjuntor aberto: nenhuma chamada nova");
+  assert.equal(ctx2.transient, true, "conta como falha temporária (não grava negativo longo)");
+  // outros hosts seguem normais
+  await bg.ctx.request("https://api.themoviedb.org/3/x", {}, "json");
+  assert.equal(bg.calls.length, before + 1);
+});
+
+test("RT instável: reserva IMDb sai marcada como provisória e com o motivo", async () => {
+  const routes = godfatherRoutes({
+    "rottentomatoes.com": { status: 503 },
+    omdbapi: { json: { Response: "True", imdbRating: "9.2", imdbVotes: "2,262,742", Ratings: [] } },
+  });
+  delete routes["rottentomatoes.com/search"];
+  delete routes["rottentomatoes.com/m/the_godfather"];
+  const bg = loadBackground({ routes });
+  const res = await bg.send({ type: "getScore", title: "O Poderoso Chefão" });
+  assert.equal(res.value.source, "imdb");
+  assert.equal(res.provisional, true);
+  const entry = bg.store[mainKeys(bg)[0]];
+  assert.ok(entry.expires < Date.now() + 15 * 60 * 1000, "provisória vale minutos, não dias");
+});
+
+test("RT sem a obra: reserva definitiva (não provisória) e motivo rt_absent no diagnóstico", async () => {
+  const routes = godfatherRoutes({
+    "rottentomatoes.com/search": { text: rtSearch([]) },
+    omdbapi: { json: { Response: "True", imdbRating: "9.2", imdbVotes: "2,262,742", Ratings: [] } },
+  });
+  delete routes["rottentomatoes.com/m/the_godfather"];
+  const bg = loadBackground({ routes });
+  const res = await bg.send({ type: "getScore", title: "O Poderoso Chefão" });
+  assert.equal(res.value.source, "imdb");
+  assert.ok(!res.provisional);
+  assert.ok(res.miss, "diagnóstico do motivo presente");
+});
+
+test("Disney+: o UUID do card vai direto ao RT pelo Wikidata (dpe:), sem TMDB", async () => {
+  const uuid = "cac75c8f-a9e2-4d95-ac73-1cf1cc7b9568";
+  const bg = loadBackground({
+    routes: {
+      "query.wikidata.org": wikidataByKey({ [`dpe:${uuid}`]: { rt: "tv/the_simpsons", label: "The Simpsons", year: 1989 } }),
+      "algolia.net": algoliaByTitle([hit({ title: "The Simpsons", type: "tv", year: 1989, vanity: "the_simpsons", critics: 85, audience: 76 })]),
+    },
+  });
+  const res = await bg.send({ type: "getScore", title: "Os Simpsons", site: "disney", dpId: uuid });
+  assert.equal(res.value.url, "https://www.rottentomatoes.com/tv/the_simpsons");
+  assert.equal(res.value.critics, 85);
+  assert.equal(res.via, "disney-id");
+  assert.ok(!bg.calls.some((u) => u.includes("themoviedb")), "nenhuma chamada ao TMDB");
+});
+
+test("nota por página é compartilhada: segundo título que cai na mesma página não reabre o RT", async () => {
+  const bg = loadBackground({
+    routes: squidRoutes({
+      // o índice só traz a nota de críticos: a página é necessária pra audiência
+      "algolia.net": algolia(hit({ title: "Squid Game", type: "tv", year: 2021, vanity: "squid_game", critics: 86 })),
+      "rottentomatoes.com/tv/squid_game": { text: rtPage({ critics: 86, audience: 67 }) },
+    }),
+  });
+  const pageCalls = () => bg.calls.filter((u) => u.includes("rottentomatoes.com/tv/squid_game")).length;
+  const a = await bg.send({ type: "getScore", title: "Round 6", site: "netflix" });
+  assert.equal(a.value.audience, 67);
+  assert.equal(pageCalls(), 1);
+  const b = await bg.send({ type: "getScore", title: "Round 6", site: "disney" }); // outra chave de cache, mesma obra
+  assert.equal(b.value.audience, 67);
+  assert.equal(pageCalls(), 1, "reaproveita a nota da página");
+});
+
+test("correção manual: vale pra este título e some ao remover", async () => {
+  const routes = godfatherRoutes();
+  routes["rottentomatoes.com/m/outro_filme"] = { text: rtPage({ critics: 11, audience: 22 }) };
+  const bg = loadBackground({ routes });
+  const base = await bg.send({ type: "getScore", title: "O Poderoso Chefão" });
+  assert.equal(base.value.critics, 97);
+  const set = await bg.send({ type: "setOverride", title: "O Poderoso Chefão", path: "m/outro_filme" });
+  assert.equal(set.ok, true);
+  const fixed = await bg.send({ type: "getScore", title: "O Poderoso Chefão" });
+  assert.equal(fixed.value.critics, 11);
+  assert.equal(fixed.via, "override");
+  assert.ok(bg.store["vop:ovr"], "correção do usuário fica em vop:ovr (protegida)");
+  await bg.send({ type: "clearOverride", title: "O Poderoso Chefão" });
+  const back = await bg.send({ type: "getScore", title: "O Poderoso Chefão" });
+  assert.equal(back.value.critics, 97);
+});
+
+test("correção manual com endereço inválido é ignorada", async () => {
+  const bg = loadBackground({ routes: godfatherRoutes() });
+  const res = await bg.send({ type: "setOverride", title: "X", path: "https://evil.example/x" });
+  assert.ok(res === undefined || res.ok !== true);
+  assert.equal(bg.store["vop:ovr"], undefined);
+});
+
+test("estatísticas locais: contam o título uma vez e guardam os sem nota do RT", async () => {
+  const routes = godfatherRoutes({
+    "rottentomatoes.com/search": { text: rtSearch([]) },
+    omdbapi: { json: { Response: "True", imdbRating: "9.2", imdbVotes: "2,262,742", Ratings: [] } },
+  });
+  delete routes["rottentomatoes.com/m/the_godfather"];
+  const bg = loadBackground({ routes });
+  await bg.send({ type: "getScore", title: "O Poderoso Chefão", site: "netflix" });
+  await bg.send({ type: "getScore", title: "O Poderoso Chefão", site: "netflix" });
+  await new Promise((r) => setTimeout(r, 50)); // a gravação das estatísticas é encadeada
+  const res = await bg.send({ type: "getStats" });
+  assert.equal(res.ok, true);
+  const days = Object.values(res.stats.days);
+  assert.equal(days.reduce((s, d) => s + d.n, 0), 1, "mesmo título no mesmo dia conta uma vez");
+  assert.equal(res.misses.length, 1);
+  assert.equal(res.misses[0].src, "imdb");
+  const clear = await bg.send({ type: "clearStats" });
+  assert.equal(clear.ok, true);
+  assert.equal(bg.store["vop:stats"], undefined);
+  assert.equal(bg.store["vop:misses"], undefined);
+});
+
+test("Netflix: tipo (filme/série) vem do JSON-LD da página pública e fica em cache", async () => {
+  const ld = (t) => `<html><script type="application/ld+json">{"@context":"https://schema.org","@type":"${t}","name":"X","dateCreated":"2024"}</script></html>`;
+  const bg = loadBackground({ routes: { "netflix.com/title/111": { text: ld("TVSeries") }, "netflix.com/title/222": { text: ld("Movie") } } });
+  assert.equal(await bg.ctx.netflixType("111", {}), "tv");
+  assert.equal(await bg.ctx.netflixType("222", {}), "movie");
+  const n = bg.calls.length;
+  assert.equal(await bg.ctx.netflixType("111", {}), "tv");
+  assert.equal(bg.calls.length, n, "segunda leitura vem do cache");
+  const off = loadBackground({ routes: { "netflix.com/title/333": { status: 500 } } });
+  assert.equal(await off.ctx.netflixType("333", {}), null, "sem página: sem tipo, sem gravar");
+});
+
+test("nameVariants: tira ano, temporada, 'o filme' e prefixo de estúdio; só a cabeça antes de ':' fica insegura", () => {
+  const bg = loadBackground();
+  const v = (t) => bg.ctx.nameVariants(t).map((x) => `${x.t}${x.safe ? "" : "?"}`);
+  const out = v("Marvel Studios' Thor: Ragnarok (2017)");
+  assert.ok(out.includes("Thor: Ragnarok"), JSON.stringify(out));
+  assert.ok(out.includes("Thor?"), "cabeça isolada exige conferir o catálogo");
+  assert.ok(v("Dark: Temporada 2").includes("Dark"));
+  assert.ok(v("Os Simpsons - O Filme").some((s) => s.startsWith("Os Simpsons")));
+  assert.equal(v("Dark").length, 0, "nome limpo não gera variantes");
+});
+
+test("mensagens: título vazio na correção e na estatística não quebra", async () => {
+  const bg = loadBackground();
+  assert.equal((await bg.send({ type: "getStats" })).ok, true);
+  const r = await bg.send({ type: "clearOverride", title: "   " });
+  assert.ok(r === undefined || r.ok !== false);
 });
